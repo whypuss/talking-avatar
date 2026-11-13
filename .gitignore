@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+
+# Large model weights & cloned third-party repos
+Wav2Lip/
+weights/
+gfpgan/
+models/
+
+# Generated outputs & temporary media
+output/
+tmp/
+*.mp4
+*.wav
+*.aiff
+*.pth
+*.onnx
