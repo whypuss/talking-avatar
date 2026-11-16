@@ -1,19 +1,58 @@
 # Talking Avatar Pipeline (全畫面高清對口型數字人)
 
-將任意人像圖片與文字（或音訊）轉換成**保留完整原始構圖、自然呼吸微動、高清嘴部與停頓自動閉嘴**的 MP4 講話視頻。專為 **Apple Silicon (M1/M2 8GB 統一記憶體)** 與本地 CPU/GPU 環境最佳化。
+將任意人像圖片與文字（或預先合成的音訊）轉換成**保留完整原始構圖、自然呼吸微動、自然頭部與眨眼動作、高清嘴部與停頓自動閉嘴**的 MP4 講話視頻。專為 **Apple Silicon (M1/M2 8GB 統一記憶體)** 與本地 CPU/GPU 環境最佳化。
 
-## 核心流程
+---
 
-1. **語音合成 / 音訊正規化**：支援 macOS 原生語音（粵語 `Sinji`、國語 `Tingting`）、`edge-tts` 或直接傳入音訊檔，自動轉為 16kHz 單聲道 WAV。
-2. **全畫面自然呼吸底片**：保留原始圖片完整背景與上半身構圖，加入細微的呼吸起伏（自動裁齊偶數寬高以相容 H.264）。
-3. **Wav2Lip-GAN 時序平滑對口型**：啟用時序平滑並收緊下巴 padding（`0 10 0 0`），讓嘴唇開合貼合語音節奏。
-4. **GFPGAN v1.4 高清修復 + 68 點下半臉凸包融合**：修復 Wav2Lip 嘴部像素模糊問題，並偵測音訊 RMS 靜音停頓區段平滑過渡回原圖表情，最後以 `0.12s` 音畫延遲校準輸出。
+## 模型架構與技術棧總覽
+
+本專案採用多模型串接管線（Pipeline），各階段使用的核心模型與工具如下：
+
+| 階段 | 模型 / 工具 | 用途與特點 | 備註 |
+| :--- | :--- | :--- | :--- |
+| **1. 語音合成 (TTS)** | **CosyVoice2-Yue** (`jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx`) | 粵語零樣本聲線複製（Zero-shot Voice Cloning），產出高自然度粵語主播音軌 | 需搭配 `--ref_audio` 與 `--ref_text` 獨立生成 WAV 後以 `--audio` 傳入 |
+| | **macOS `say`** (`Sinji` 粵語 / `Tingting` 國語) | 系統內建離線語音合成 | 透過 `--voice Sinji` 直接調用 |
+| | **Edge TTS** (`edge-tts`) | 微軟雲端免費神經網路語音 | 透過 `--voice edge:zh-HK-HiuGaaiNeural` 調用 |
+| **2. 人臉偵測與關鍵點** | **InsightFace** (`buffalo_l` / 68 點人臉特徵點) | 精準定位人臉邊界、眼睛輪廓與下半臉嘴部區域 | 用於 68 點下半臉凸包遮罩（Convex Hull）與自然眨眼/頭部微動控制 |
+| **3. 口型同步 (Lip-Sync)** | **Wav2Lip-GAN** (`wav2lip_gan.pth`) | 根據 16kHz 音訊梅爾頻譜（Mel-spectrogram）驅動嘴唇開合 | 啟用時序平滑並收緊下巴 padding（`0 10 0 0`），貼合語音節奏 |
+| **4. 畫質高清修復** | **GFPGAN v1.4** (`GFPGANv1.4.pth`) | 修復 Wav2Lip 嘴部區域的像素模糊與鋸齒，還原皮膚與牙齒細節 | 預設於 CPU 執行以防 8GB 記憶體溢出，可透過 `--gfpgan-weight` 調整混合權重 |
+| **5. 音畫處理與封裝** | **FFmpeg** (`libx264` / `aac`) | 16kHz 單聲道音訊正規化、偶數寬高裁切、音畫延遲校準與 MP4 封裝 | 預設音訊延遲 `120ms` 對齊中文發音起音 |
+
+---
+
+## 完整執行流程
+
+```text
+輸入人像 (Image) ──▶ [1] 全畫面自然呼吸與微動底片生成 (保留原圖背景與上半身構圖)
+                              │
+輸入文字 / 音訊  ──▶ [2] 語音合成與 16kHz 單聲道 WAV 正規化
+                              │
+                              ▼
+                     [3] Wav2Lip-GAN 時序平滑對口型 (pads: 0 10 0 0)
+                              │
+                              ▼
+                     [4] GFPGAN v1.4 嘴部高清修復
+                              │
+                              ▼
+                     [5] InsightFace 68 點下半臉凸包融合 + RMS 靜音停頓閉嘴過渡
+                              │
+                              ▼
+                     [6] FFmpeg 0.12s 音畫延遲校準與 H.264 MP4 輸出
+```
+
+### 流程細節說明
+1. **音訊正規化**：無論輸入為文字（TTS）或現成音訊檔（`.wav` / `.mp3` / `.m4a`），皆會自動轉為 **16kHz、單聲道（Mono）、16-bit PCM WAV**，確保 Wav2Lip 梅爾頻譜提取準確。
+2. **全畫面自然呼吸與頭部/眼部微動底片**：保留原始圖片完整背景與構圖（自動裁齊偶數寬高以相容 H.264 編碼），並依據物理節奏加入細微的呼吸起伏、自然頭部擺動與低頻眨眼動作（參考 `docs/anchor_motion_spec.md`）。
+3. **Wav2Lip-GAN 對口型**：使用 `wav2lip_gan.pth` 進行嘴部動作生成，收緊下巴邊界（`--pads 0 10 0 0`）避免雙下巴偽影。
+4. **GFPGAN v1.4 高清修復與凸包融合**：對 Wav2Lip 輸出的模糊嘴部進行超解析度修復，並利用 InsightFace 68 點特徵點構建下半臉凸包遮罩，將修復後的嘴部無縫融合回呼吸底片。
+5. **RMS 靜音停頓自動閉嘴**：即時偵測音訊 RMS 能量，當進入靜音停頓區段時平滑過渡回原圖閉嘴表情，消除無聲時的嘴唇抖動。
+6. **音畫對齊封裝**：最後透過 FFmpeg 進行 `120ms`（可調）音畫延遲校準，輸出標準 `yuv420p` H.264 MP4。
 
 ---
 
 ## 快速安裝
 
-需求：`Python 3.10–3.12`、`ffmpeg`（macOS 可用 `brew install ffmpeg`）。
+系統需求：`Python 3.10–3.12`、`ffmpeg`（macOS 可用 `brew install ffmpeg`）。
 
 ```bash
 git clone https://github.com/whypuss/talking-avatar.git
@@ -21,41 +60,68 @@ cd talking-avatar
 bash setup.sh
 ```
 
-> 若你本機已經有 `Wav2Lip/`、`weights/GFPGANv1.4.pth` 或 `insightface` 模型，可透過環境變數直接指定，無須重複下載：
-> - `WAV2LIP_DIR=/path/to/Wav2Lip`
-> - `GFPGAN_WEIGHTS=/path/to/GFPGANv1.4.pth`
-> - `INSIGHTFACE_ROOT=/path/to/insightface`
+> **重複利用本機既有模型權重**：  
+> 若本機已下載 `Wav2Lip/`、`GFPGANv1.4.pth` 或 `insightface` 模型，可透過環境變數直接指定，無須重複下載：
+> ```bash
+> export WAV2LIP_DIR=/path/to/Wav2Lip
+> export GFPGAN_WEIGHTS=/path/to/GFPGANv1.4.pth
+> export INSIGHTFACE_ROOT=/path/to/insightface
+> ```
 
 ---
 
-## 使用方法（任意圖片皆可）
+## 使用方法
 
 ```bash
 source .venv/bin/activate
+```
 
-# 1. 圖片 + 粵語文字（macOS Sinji）
+### 1. 搭配 CosyVoice2-Yue 粵語聲線複製（推薦高品質方案）
+先使用 `CosyVoice2-Yue-ZoengJyutGaai-mlx` 根據參考音軌生成粵語 WAV，再傳入 `generate.py`：
+
+```bash
+# 步驟 A：生成粵語複製聲線音訊（於 cosyvoice2-yue 環境執行）
+~/projects/cosyvoice2-yue/.venv/bin/python3 -m mlx_audio.tts.generate \
+  --model jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx \
+  --text "各位觀眾大家好，今日為大家報導最新科技新聞。" \
+  --ref_audio ref_voice.wav \
+  --ref_text "參考音軌的對應逐字稿" \
+  --output_path output/cantonese_tts.wav
+
+# 步驟 B：生成對口型高清主播視頻
+python generate.py \
+  --image anchor.jpg \
+  --audio output/cantonese_tts.wav \
+  --output output/news_cantonese.mp4
+```
+
+> **注意**：凡語音音軌內容、語速或分段時長有變更時，必須重新執行 `generate.py` 生成視頻，切勿直接將新音訊混流至舊版視頻，以免嘴型不同步。
+
+### 2. 圖片 + 內建文字轉語音（macOS `say` / `edge-tts`）
+```bash
+# 粵語（macOS Sinji）
 python generate.py \
   --image your_photo.jpg \
   --text "各位觀眾大家好，今日為大家報導最新科技新聞。" \
   --voice Sinji \
   --output output/news_cantonese.mp4
 
-# 2. 圖片 + 國語文字（macOS Tingting）
+# 國語（macOS Tingting）
 python generate.py \
   --image your_photo.jpg \
   --text "大家好，歡迎收看今天的節目。" \
   --voice Tingting \
   --output output/news_mandarin.mp4
 
-# 3. 圖片 + 現成音訊檔（支援 wav / mp3 / m4a）
+# Edge TTS 粵語女聲
 python generate.py \
   --image your_photo.jpg \
-  --audio speech.mp3 \
-  --output output/from_audio.mp4
+  --text "歡迎收看今日新聞快訊。" \
+  --voice edge:zh-HK-HiuGaaiNeural \
+  --output output/news_edge.mp4
 ```
 
-### 選用：長文章自動改寫為口播稿 (`summarize.py`)
-
+### 3. 選用：長文章自動改寫為口播稿 (`summarize.py`)
 支援任何 OpenAI 相容 API（透過環境變數設定，切勿將金鑰寫入程式碼）：
 
 ```bash
@@ -69,15 +135,22 @@ python generate.py --image your_photo.jpg --text-file script.txt --output output
 
 ---
 
-## 常用參數說明
+## 完整參數說明
 
 | 參數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
-| `--image` | 必填 | 任意人像照片（建議正面或微側臉、光線清晰） |
-| `--text` / `--text-file` / `--audio` | 三選一 | 要說的文字內容或現成音訊檔 |
-| `--voice` | `Sinji` | macOS `say` 聲線，或使用 `edge:zh-HK-HiuGaaiNeural` |
+| `--image` | **必填** | 任意人像照片（建議正面或微側臉、光線清晰） |
+| `--text` / `--text-file` / `--audio` | **三選一** | 要說的文字內容、文字檔路徑，或現成音訊檔（支援 `wav`/`mp3`/`m4a`） |
+| `--output` | `output/result.mp4` | 輸出 MP4 檔案路徑 |
+| `--voice` | `Sinji` | macOS `say` 聲線（如 `Sinji`、`Tingting`），或 `edge:<voice>` |
+| `--rate` | `185` | macOS `say` 語速（每分鐘字數） |
+| `--fps` | `25` | 輸出視頻幀率 |
 | `--breathing-amp` | `0.6` | 呼吸微動幅度（像素），設為 `0` 可關閉 |
-| `--gfpgan-weight` | `0.65` | GFPGAN 嘴部清晰化權重（`0` 可跳過以加速） |
+| `--gfpgan-weight` | `0.65` | GFPGAN 嘴部清晰化混合權重（`0` 可跳過以加速推論） |
 | `--pads` | `0 10 0 0` | Wav2Lip 臉部邊界擴展（上 下 左 右） |
 | `--audio-delay-ms` | `120` | 音訊延遲毫秒數，對齊中文發音起音 |
-| `--device` | `cpu` | GFPGAN 推論裝置（M1 8GB 建議用 `cpu` 防記憶體溢出） |
+| `--device` | `cpu` | GFPGAN 推論裝置（`cpu` 或 `cuda`；M1 8GB 建議用 `cpu` 防記憶體溢出） |
+| `--wav2lip-dir` | `./Wav2Lip` | Wav2Lip 專案目錄路徑（可由環境變數 `WAV2LIP_DIR` 指定） |
+| `--gfpgan-weights` | `./weights/GFPGANv1.4.pth` | GFPGAN 權重檔路徑（可由環境變數 `GFPGAN_WEIGHTS` 指定） |
+| `--insightface-root` | `~/.insightface` | InsightFace 模型根目錄（可由環境變數 `INSIGHTFACE_ROOT` 指定） |
+| `--keep-temp` | `False` | 保留輸出目錄中的中間暫存檔案以供除錯 |

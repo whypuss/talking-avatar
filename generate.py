@@ -79,6 +79,7 @@ def build_breathing_base(
     duration: float,
     fps: int = 25,
     amp: float = 0.6,
+    audio_path: str | None = None,
 ) -> tuple[int, int]:
     """Generate a full-frame subtle breathing base video with even dimensions."""
     img = cv2.imread(image_path)
@@ -95,14 +96,169 @@ def build_breathing_base(
     total_frames = max(1, int(math.ceil(duration * fps)))
     writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
+    # Detect face once to anchor head-only natural sway/nod while keeping background static
+    head_mask = None
+    eye_boxes = []
+    pivot = (w / 2.0, h / 2.0)
+    if amp > 0:
+        try:
+            from insightface.app import FaceAnalysis
+            app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+            app.prepare(ctx_id=-1, det_size=(640, 640))
+            faces = app.get(img)
+            if faces:
+                face = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)[0]
+                box = face.bbox
+                x1, y1, x2, y2 = [float(v) for v in box]
+                fw, fh = x2 - x1, y2 - y1
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                # Pivot at neck base
+                pivot = (cx, min(float(h - 1), y2 + fh * 0.25))
+                # Soft elliptical mask covering head + hair
+                yy, xx = np.ogrid[:h, :w]
+                rx, ry = fw * 0.95, fh * 1.15
+                dist = ((xx - cx) / max(1.0, rx)) ** 2 + ((yy - (cy - fh * 0.08)) / max(1.0, ry)) ** 2
+                mask = np.clip(1.35 - dist, 0.0, 1.0).astype(np.float32)
+                mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(5.0, fw * 0.08))
+                head_mask = mask[..., None]
+                # Extract left & right eye boxes from 2D landmarks (kps[0]=left_eye, kps[1]=right_eye)
+                if hasattr(face, "kps") and face.kps is not None and len(face.kps) >= 2:
+                    ew = max(12, int(fw * 0.22))
+                    eh = max(8, int(fh * 0.11))
+                    for ex, ey in face.kps[:2]:
+                        ex_i, ey_i = int(round(ex)), int(round(ey))
+                        eye_boxes.append((
+                            max(0, ex_i - ew // 2),
+                            max(0, ey_i - eh // 2),
+                            min(w, ex_i + ew // 2),
+                            min(h, ey_i + eh // 2),
+                        ))
+        except Exception:
+            head_mask = None
+
+    # Compute per-frame speech energy for natural pauses and accent nods
+    rms_env = np.ones(total_frames, dtype=np.float32)
+    if audio_path and os.path.exists(audio_path):
+        try:
+            import librosa
+            y, sr = librosa.load(audio_path, sr=16000)
+            hop = max(1, int(sr / fps))
+            rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+            if len(rms) > 0:
+                rms_norm = rms / (np.percentile(rms, 95) + 1e-6)
+                rms_norm = np.clip(rms_norm, 0.0, 1.2)
+                n = min(total_frames, len(rms_norm))
+                rms_env[:n] = rms_norm[:n]
+                if n < total_frames:
+                    rms_env[n:] = 0.0
+        except Exception:
+            pass
+
+    # Precompute professional news anchor head trajectory:
+    # Upright baseline, subtle accent micro-nods, gentle turn-of-phrase tilt (2-4 deg) & return,
+    # and a brief downward glance/nod near ~9s (or ~83% mark for shorter clips).
+    dx_arr = np.zeros(total_frames, dtype=np.float32)
+    dy_arr = np.zeros(total_frames, dtype=np.float32)
+    ang_arr = np.zeros(total_frames, dtype=np.float32)
+
+    cur_dy, cur_ang = 0.0, 0.0
+    tgt_ang = 0.0
+    tilt_timer = 0
+    tilt_dir = 1.0
+    nod_timer = 0
+    nod_cooldown = 0
+    glance_frame = int(min(9.0 * fps, total_frames * 0.83)) if total_frames > int(2.5 * fps) else -1
+
+    for idx in range(total_frames):
+        e = float(rms_env[idx])
+        is_speaking = e > 0.15
+
+        # Subtle micro-nods synced to vocal emphasis (1-3 deg equivalent)
+        if nod_cooldown > 0:
+            nod_cooldown -= 1
+        if is_speaking and nod_cooldown == 0 and (idx == 0 or rms_env[idx - 1] <= 0.15 or e > 0.70):
+            nod_timer = int(fps * 0.42)
+            nod_cooldown = int(fps * 0.90)
+
+        # Occasional gentle tilt (2-4 deg) at phrase transitions, then return to 0
+        if tilt_timer > 0:
+            tilt_timer -= 1
+            if tilt_timer == 0:
+                tgt_ang = 0.0
+        elif is_speaking and idx > 0 and idx % int(fps * 2.8) == 0:
+            tgt_ang = tilt_dir * min(3.2, 2.0 * amp)
+            tilt_dir *= -1.0
+            tilt_timer = int(fps * 1.1)
+
+        # Brief downward nod/glance (~0.6s) around 9s mark (or 83% of short clip)
+        glance_dy = 0.0
+        if glance_frame > 0 and glance_frame <= idx < glance_frame + int(fps * 0.65):
+            gp = (idx - glance_frame) / max(1.0, fps * 0.65)
+            glance_dy = 3.5 * amp * math.sin(math.pi * gp)
+
+        alpha = 0.10
+        cur_ang += (tgt_ang - cur_ang) * alpha
+
+        nod_dy = 0.0
+        if nod_timer > 0:
+            p = 1.0 - (nod_timer / max(1.0, fps * 0.42))
+            nod_dy = 1.8 * amp * math.sin(math.pi * (p ** 0.65))
+            nod_timer -= 1
+
+        cur_dy += ((nod_dy + glance_dy) - cur_dy) * 0.35
+        dx_arr[idx] = 0.0
+        dy_arr[idx] = cur_dy
+        ang_arr[idx] = cur_ang
+
+    # Precompute natural blink schedule (~3x slower: start around 3.0s, then every ~6.5s)
+    blink_times = [3.0, 9.5]
+    t_next = 16.0
+    while t_next < duration + 1.0:
+        blink_times.append(t_next)
+        t_next += 6.5
+
     for idx in range(total_frames):
         if amp > 0:
             t = idx / float(fps)
-            dy = amp * math.sin(2.0 * math.pi * 0.28 * t)
-            scale = 1.0 + 0.0018 * math.sin(2.0 * math.pi * 0.28 * t)
-            mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), 0.0, scale)
-            mat[1, 2] += dy
-            frame = cv2.warpAffine(img, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+            src_img = img
+            if eye_boxes:
+                # Compute blink closure factor [0..1] (fast close ~0.07s, fast open ~0.11s)
+                blink_amt = 0.0
+                for bt in blink_times:
+                    dt = t - bt
+                    if -0.07 <= dt <= 0.11:
+                        blink_amt = 1.0 - abs(dt / (0.07 if dt < 0 else 0.11))
+                        blink_amt = max(0.0, min(1.0, blink_amt))
+                        break
+                # Subtle horizontal micro-saccade for teleprompter reading
+                saccade_x = 0.8 * math.sin(2.0 * math.pi * 0.85 * t)
+                if blink_amt > 0.02 or abs(saccade_x) > 0.05:
+                    src_img = img.copy()
+                    for ex1, ey1, ex2, ey2 in eye_boxes:
+                        roi = img[ey1:ey2, ex1:ex2]
+                        rh, rw = roi.shape[:2]
+                        if rh < 4 or rw < 4:
+                            continue
+                        # Vertical squeeze toward lower eyelid for natural blink + tiny horizontal shift
+                        sy = max(0.15, 1.0 - 0.85 * blink_amt)
+                        m_eye = np.float32([[1.0, 0.0, saccade_x], [0.0, sy, (1.0 - sy) * rh * 0.65]])
+                        warped_eye = cv2.warpAffine(roi, m_eye, (rw, rh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                        # Soft elliptical blend mask for eye ROI
+                        ey_y, ey_x = np.ogrid[:rh, :rw]
+                        emask = np.clip(1.2 - (((ey_x - rw / 2.0) / (rw * 0.48)) ** 2 + ((ey_y - rh / 2.0) / (rh * 0.45)) ** 2), 0.0, 1.0).astype(np.float32)
+                        emask = cv2.GaussianBlur(emask, (0, 0), sigmaX=max(1.5, rw * 0.08))[..., None]
+                        src_img[ey1:ey2, ex1:ex2] = np.clip(warped_eye * emask + roi * (1.0 - emask), 0, 255).astype(np.uint8)
+
+            scale = 1.0 + 0.0015 * math.sin(2.0 * math.pi * 0.25 * t)
+            mat = cv2.getRotationMatrix2D(pivot, float(ang_arr[idx]), scale)
+            mat[0, 2] += float(dx_arr[idx])
+            mat[1, 2] += float(dy_arr[idx])
+            warped = cv2.warpAffine(src_img, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+            if head_mask is not None:
+                frame = np.clip(warped.astype(np.float32) * head_mask + img.astype(np.float32) * (1.0 - head_mask), 0, 255).astype(np.uint8)
+            else:
+                frame = warped
         else:
             frame = img
         writer.write(frame)
@@ -205,42 +361,69 @@ def restore_and_blend(
     writer = cv2.VideoWriter(temp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
     last_jaw_poly = None
+    roi_box = None
     for i in range(total_frames):
         ret, frame = cap.read()
         ret_base, base_frame = base_cap.read()
         if not ret or not ret_base:
             break
 
+        # Detect face ROI on first frame so GFPGAN & InsightFace only process the face region
+        if roi_box is None:
+            init_faces = app.get(frame)
+            if not init_faces:
+                app.prepare(ctx_id=-1, det_size=(320, 320))
+                init_faces = app.get(frame)
+            if init_faces:
+                fx1, fy1, fx2, fy2 = [int(v) for v in init_faces[0].bbox]
+                fw, fh = fx2 - fx1, fy2 - fy1
+                rx1 = max(0, fx1 - int(fw * 0.6))
+                ry1 = max(0, fy1 - int(fh * 0.4))
+                rx2 = min(w, fx2 + int(fw * 0.6))
+                ry2 = min(h, fy2 + int(fh * 0.6))
+                roi_box = (rx1, ry1, rx2, ry2)
+
+        if roi_box is not None:
+            rx1, ry1, rx2, ry2 = roi_box
+            crop = frame[ry1:ry2, rx1:rx2]
+            base_crop = base_frame[ry1:ry2, rx1:rx2]
+        else:
+            crop = frame
+            base_crop = base_frame
+
         if restorer is not None:
-            _, _, enhanced_talk = restorer.enhance(
-                frame,
+            _, _, enhanced_crop = restorer.enhance(
+                crop,
                 has_aligned=False,
                 only_center_face=True,
                 paste_back=True,
                 weight=gfpgan_weight,
             )
         else:
-            enhanced_talk = frame
+            enhanced_crop = crop
 
-        faces = app.get(enhanced_talk)
-        if not faces and i == 0:
-            app.prepare(ctx_id=-1, det_size=(320, 320))
-            faces = app.get(enhanced_talk)
-
+        faces = app.get(enhanced_crop)
         if faces:
             pts68 = faces[0].landmark_3d_68[:, :2]
             jaw_pts = np.vstack([pts68[3:14], pts68[35:30:-1]])
             last_jaw_poly = cv2.convexHull(jaw_pts.astype(np.int32))
 
         w_speak = float(speak_weights[i])
+        ch, cw = crop.shape[:2]
         if last_jaw_poly is not None:
-            mask = np.zeros((h, w), dtype=np.float32)
+            mask = np.zeros((ch, cw), dtype=np.float32)
             cv2.fillConvexPoly(mask, last_jaw_poly, 1.0)
             mask = cv2.GaussianBlur(mask, (15, 15), 5)
             mask_3c = (mask * w_speak)[:, :, None]
-            final_frame = (enhanced_talk * mask_3c + base_frame * (1.0 - mask_3c)).astype(np.uint8)
+            blended_crop = (enhanced_crop * mask_3c + base_crop * (1.0 - mask_3c)).astype(np.uint8)
         else:
-            final_frame = enhanced_talk
+            blended_crop = enhanced_crop
+
+        if roi_box is not None:
+            final_frame = base_frame.copy()
+            final_frame[ry1:ry2, rx1:rx2] = blended_crop
+        else:
+            final_frame = blended_crop
 
         writer.write(final_frame)
         if (i + 1) % 25 == 0 or (i + 1) == total_frames:
@@ -323,7 +506,7 @@ def main() -> None:
         print(f"Audio duration: {duration:.2f}s")
 
         print("=== [2/4] Building full-frame breathing base ===")
-        w, h = build_breathing_base(args.image, base_mp4, duration=duration + 0.5, fps=args.fps, amp=args.breathing_amp)
+        w, h = build_breathing_base(args.image, base_mp4, duration=duration + 0.5, fps=args.fps, amp=args.breathing_amp, audio_path=audio_wav)
         print(f"Base video: {w}x{h} @ {args.fps}fps")
 
         print("=== [3/4] Running Wav2Lip-GAN (smoothed) ===")
