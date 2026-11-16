@@ -321,6 +321,85 @@ def compute_silence_weights(audio_path: str, total_frames: int, fps: int = 25) -
     return np.clip(weights, 0.0, 1.0)
 
 
+def _split_subtitle_segments(text: str, max_chars: int = 16) -> list[str]:
+    """Split Traditional Chinese text into readable subtitle segments."""
+    import re
+    raw_parts = [p.strip() for p in re.split(r"[，。！？；、,\.\n]+", text) if p.strip()]
+    segments: list[str] = []
+    for part in raw_parts:
+        while len(part) > max_chars:
+            segments.append(part[:max_chars])
+            part = part[max_chars:]
+        if part:
+            segments.append(part)
+    return segments or [text.strip()]
+
+
+def _load_tc_font(font_size: int):
+    """Load a Traditional Chinese font available on macOS/Linux."""
+    from PIL import ImageFont
+    candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, font_size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _build_subtitle_timeline(text: str, total_frames: int) -> list[tuple[int, int, str]]:
+    """Allocate frame ranges [start, end) for each subtitle segment by character length."""
+    segments = _split_subtitle_segments(text)
+    total_chars = sum(max(1, len(s)) for s in segments)
+    timeline: list[tuple[int, int, str]] = []
+    cursor = 0
+    for idx, seg in enumerate(segments):
+        if idx == len(segments) - 1:
+            end = total_frames
+        else:
+            span = max(1, round(total_frames * (len(seg) / total_chars)))
+            end = min(total_frames, cursor + span)
+        timeline.append((cursor, end, seg))
+        cursor = end
+    return timeline
+
+
+def _draw_subtitle_frame(frame_bgr: np.ndarray, text: str, font) -> np.ndarray:
+    """Draw Traditional Chinese subtitle with semi-transparent backdrop and stroke."""
+    from PIL import Image, ImageDraw
+    h, w = frame_bgr.shape[:2]
+    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    pad_x = max(14, int(w * 0.02))
+    pad_y = max(8, int(h * 0.012))
+    x = (w - tw) // 2
+    y = int(h * 0.90) - th
+
+    box = [x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y]
+    draw.rounded_rectangle(box, radius=10, fill=(0, 0, 0, 155))
+    draw.text(
+        (x, y),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        stroke_width=2,
+        stroke_fill=(0, 0, 0, 230),
+    )
+    composited = Image.alpha_composite(img, overlay).convert("RGB")
+    return cv2.cvtColor(np.array(composited), cv2.COLOR_RGB2BGR)
+
+
 def restore_and_blend(
     wav2lip_video: str,
     base_video: str,
@@ -332,6 +411,7 @@ def restore_and_blend(
     fps: int = 25,
     audio_delay_ms: int = 120,
     device_str: str = "cpu",
+    subtitle_text: str | None = None,
 ) -> None:
     """Restore mouth HD texture with GFPGAN, blend lower-face convex hull, and mux with sync offset."""
     app = FaceAnalysis(name="buffalo_l", root=insightface_root, providers=["CPUExecutionProvider"])
@@ -425,6 +505,15 @@ def restore_and_blend(
         else:
             final_frame = blended_crop
 
+        if subtitle_text:
+            if i == 0:
+                _sub_font = _load_tc_font(max(24, int(final_frame.shape[1] * 0.042)))
+                _sub_timeline = _build_subtitle_timeline(subtitle_text, total_frames)
+            for _s_start, _s_end, _s_seg in _sub_timeline:
+                if _s_start <= i < _s_end:
+                    final_frame = _draw_subtitle_frame(final_frame, _s_seg, _sub_font)
+                    break
+
         writer.write(final_frame)
         if (i + 1) % 25 == 0 or (i + 1) == total_frames:
             print(f"[HD Restore] {i + 1}/{total_frames} frames processed")
@@ -484,6 +573,8 @@ def main() -> None:
     parser.add_argument("--gfpgan-weights", default=os.environ.get("GFPGAN_WEIGHTS", str(repo_dir / "weights" / "GFPGANv1.4.pth")))
     parser.add_argument("--insightface-root", default=default_insightface)
     parser.add_argument("--keep-temp", action="store_true", help="Keep intermediate files in output directory.")
+    parser.add_argument("--subtitles", action="store_true", help="Burn Traditional Chinese subtitles from --text / --text-file.")
+    parser.add_argument("--subtitle-text", help="Explicit Traditional Chinese subtitle text to burn onto the video.")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -512,6 +603,14 @@ def main() -> None:
         print("=== [3/4] Running Wav2Lip-GAN (smoothed) ===")
         run_wav2lip(args.wav2lip_dir, base_mp4, audio_wav, wav2lip_mp4, pads=args.pads)
 
+        sub_txt = args.subtitle_text
+        if not sub_txt and args.subtitles:
+            if args.text:
+                sub_txt = args.text
+            elif args.text_file and os.path.exists(args.text_file):
+                with open(args.text_file, "r", encoding="utf-8") as f:
+                    sub_txt = f.read().strip()
+
         print("=== [4/4] GFPGAN HD restoration & silence-aware blending ===")
         restore_and_blend(
             wav2lip_video=wav2lip_mp4,
@@ -524,6 +623,7 @@ def main() -> None:
             fps=args.fps,
             audio_delay_ms=args.audio_delay_ms,
             device_str=args.device,
+            subtitle_text=sub_txt,
         )
         print(f"Done! Output saved to: {args.output}")
     finally:
