@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+whytalkv2: End-to-end Cantonese talking-avatar pipeline with voice cloning,
+automatic chunking (anti-OOM for 8GB Apple Silicon), and Traditional Chinese subtitles.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent
+COSY_PYTHON = Path.home() / "projects" / "cosyvoice2-yue" / ".venv" / "bin" / "python3"
+COSY_MODEL = "jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx"
+WHY_PYTHON = REPO_DIR / ".venv" / "bin" / "python"
+
+VOICE_PRESETS = {
+    "女主播h": {
+        "ref_audio": str(REPO_DIR / "voices" / "女主播h_ref10s.wav"),
+        "ref_text": "承認串謀分裂國家罪，分別判囚三年同三年兩個月。本案涉及嘅港獨組",
+    },
+}
+
+
+def run_cmd(cmd: list[str], cwd: str | None = None) -> None:
+    subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def get_duration(path: str) -> float:
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]).decode().strip()
+    return float(out)
+
+
+def split_text_for_chunks(text: str, num_chunks: int) -> list[str]:
+    """Split Traditional Chinese subtitle text evenly across N video chunks."""
+    clean = text.strip()
+    if num_chunks <= 1 or not clean:
+        return [clean]
+    # Prefer splitting near punctuation
+    parts = [p for p in re.split(r"(?<=[，。！？；、,])", clean) if p]
+    if len(parts) >= num_chunks:
+        buckets = [""] * num_chunks
+        total_len = sum(len(p) for p in parts)
+        target = total_len / num_chunks
+        idx = 0
+        for p in parts:
+            if idx < num_chunks - 1 and len(buckets[idx]) >= target:
+                idx += 1
+            buckets[idx] += p
+        return [b.strip() for b in buckets]
+    step = math.ceil(len(clean) / num_chunks)
+    return [clean[i * step:(i + 1) * step] for i in range(num_chunks)]
+
+
+def synthesize_cosyvoice(text: str, ref_audio: str, ref_text: str, out_dir: Path, prefix: str) -> str:
+    if not COSY_PYTHON.exists():
+        raise FileNotFoundError(f"CosyVoice2-Yue python not found: {COSY_PYTHON}")
+    cmd = [
+        str(COSY_PYTHON), "-m", "mlx_audio.tts.generate",
+        "--model", COSY_MODEL,
+        "--text", text,
+        "--ref_audio", ref_audio,
+        "--ref_text", ref_text,
+        "--file_prefix", prefix,
+    ]
+    run_cmd(cmd, cwd=str(out_dir))
+    wav = out_dir / f"{prefix}_000.wav"
+    if not wav.exists():
+        raise FileNotFoundError(f"Expected TTS output not found: {wav}")
+    return str(wav)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="whytalkv2: All-in-one Talking Avatar with Subtitles")
+    parser.add_argument("--image", required=True, help="Input portrait image path.")
+    parser.add_argument("--text", help="Traditional Chinese text to speak and show as subtitles.")
+    parser.add_argument("--audio", help="Optional pre-generated audio path (skips CosyVoice2-Yue).")
+    parser.add_argument("--subtitle-text", help="Override subtitle text (defaults to --text).")
+    parser.add_argument("--voice-ref", default="女主播h", help=f"Voice preset name: {list(VOICE_PRESETS.keys())}")
+    parser.add_argument("--ref-audio", help="Custom reference audio WAV path.")
+    parser.add_argument("--ref-text", help="Custom reference audio transcript.")
+    parser.add_argument("--output", default=str(REPO_DIR / "output" / "whytalkv2_out.mp4"), help="Output MP4 path.")
+    parser.add_argument("--chunk-sec", type=int, default=6, help="Max seconds per chunk to avoid OOM (default: 6).")
+    parser.add_argument("--hd", action="store_true", help="Enable GFPGAN v1.4 HD restoration (slower on CPU).")
+    parser.add_argument("--no-subtitles", action="store_true", help="Disable Traditional Chinese subtitles.")
+    args = parser.parse_args()
+
+    if not args.audio and not args.text:
+        parser.error("Provide either --text or --audio.")
+
+    out_path = Path(args.output).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="whytalkv2_"))
+
+    try:
+        # 1. Audio preparation
+        if args.audio:
+            audio_wav = args.audio
+        else:
+            preset = VOICE_PRESETS.get(args.voice_ref, {})
+            ref_audio = args.ref_audio or preset.get("ref_audio")
+            ref_text = args.ref_text or preset.get("ref_text")
+            if not ref_audio or not ref_text:
+                raise ValueError("Missing --ref-audio / --ref-text for voice cloning.")
+            print(f"=== [1/3] Synthesizing Cantonese voice ({args.voice_ref}) ===")
+            audio_wav = synthesize_cosyvoice(args.text, ref_audio, ref_text, work_dir, "tts")
+
+        duration = get_duration(audio_wav)
+        gfpgan_w = "0.65" if args.hd else "0"
+        sub_full = "" if args.no_subtitles else (args.subtitle_text or args.text or "")
+
+        # 2. Chunking to prevent 8GB OOM
+        if duration <= args.chunk_sec + 1.5:
+            print(f"=== [2/3] Generating single-pass video ({duration:.1f}s) ===")
+            cmd = [
+                str(WHY_PYTHON), str(REPO_DIR / "generate.py"),
+                "--image", args.image,
+                "--audio", audio_wav,
+                "--gfpgan-weight", gfpgan_w,
+                "--output", str(out_path),
+            ]
+            if sub_full:
+                cmd.extend(["--subtitle-text", sub_full])
+            run_cmd(cmd, cwd=str(REPO_DIR))
+        else:
+            print(f"=== [2/3] Splitting {duration:.1f}s audio into {args.chunk_sec}s chunks ===")
+            chunk_pattern = str(work_dir / "chunk_%02d.wav")
+            run_cmd([
+                "ffmpeg", "-y", "-i", audio_wav,
+                "-f", "segment", "-segment_time", str(args.chunk_sec),
+                "-c", "copy", chunk_pattern,
+            ])
+            chunks = sorted(work_dir.glob("chunk_*.wav"))
+            sub_parts = split_text_for_chunks(sub_full, len(chunks)) if sub_full else [""] * len(chunks)
+            out_videos: list[Path] = []
+
+            for idx, chunk_wav in enumerate(chunks):
+                print(f"--- Processing chunk {idx + 1}/{len(chunks)} ---")
+                chunk_mp4 = work_dir / f"out_{idx:02d}.mp4"
+                cmd = [
+                    str(WHY_PYTHON), str(REPO_DIR / "generate.py"),
+                    "--image", args.image,
+                    "--audio", str(chunk_wav),
+                    "--gfpgan-weight", gfpgan_w,
+                    "--output", str(chunk_mp4),
+                ]
+                if sub_parts[idx]:
+                    cmd.extend(["--subtitle-text", sub_parts[idx]])
+                run_cmd(cmd, cwd=str(REPO_DIR))
+                out_videos.append(chunk_mp4)
+
+            print("=== [3/3] Concatenating chunks ===")
+            list_file = work_dir / "concat_list.txt"
+            list_file.write_text("\n".join(f"file '{v}'" for v in out_videos), encoding="utf-8")
+            run_cmd([
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(list_file), "-c", "copy", str(out_path),
+            ])
+
+        print(f"Done! whytalkv2 output saved to: {out_path}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
