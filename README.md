@@ -1,6 +1,20 @@
-# whytalk (全畫面高清對口型數字人)
+# whytalkv3 (全畫面高清串流 MPS 對口型數字人)
 
-將任意人像圖片與文字（或預先合成的音訊）轉換成**保留完整原始構圖、自然呼吸微動、自然頭部與眨眼動作、高清嘴部與停頓自動閉嘴**的 MP4 講話視頻。專為 **Apple Silicon (M1/M2 8GB 統一記憶體)** 與本地 CPU/GPU 環境最佳化。
+將任意人像圖片與文字（或預先合成的音訊）轉換成**保留完整原始構圖、自然呼吸微動、自然頭部與眨眼動作、高清嘴部與毫秒級同步字幕**的 MP4 講話視頻。專為 **Apple Silicon (M1/M2 8GB 統一記憶體)** 深度最佳化，採用單進程分句 CosyVoice2-Yue + 零硬切串流 Apple MPS Wav2Lip-GAN 架構。
+
+## 一鍵執行 (`whytalkv3.py`)
+
+```bash
+cd ~/projects/whytalk && .venv/bin/python whytalkv3.py \
+  --image "portrait.jpg" \
+  --text "各位觀眾，歡迎收看最新科技快訊。" \
+  --voice-ref 女主播h \
+  --output output/whytalkv3_out.mp4
+```
+
+- 預設啟用 `auto`（Apple MPS GPU）串流推論（`--chunk-sec 0`，徹底消除舊版 6 秒硬切與 8GB OOM）＋ LAB 膚色對齊/嘴周銳化＋保留 24kHz 原聲。
+- 加上 `--hd` 可啟用 Apple MPS 加速的 GFPGAN v1.4 高清修復（自動跳過靜音幀）。
+- `whytalkv2.py` 保留為向後相容轉發入口，自動呼叫 `whytalkv3.py`。
 
 ---
 

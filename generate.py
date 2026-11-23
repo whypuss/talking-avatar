@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end Image-to-Talking-Avatar pipeline (v2.1 Streaming + Apple MPS accelerated).
+End-to-end Image-to-Talking-Avatar pipeline (whytalkv3 Streaming + Apple MPS accelerated).
 Turns any portrait image + text (or audio) into a full-frame HD talking-head MP4:
   1. High-sample-rate original audio preservation + 16kHz analysis track
   2. Single-pass InsightFace lite detection (detection + 3D 68-pt landmarks once, zero per-frame overhead)
