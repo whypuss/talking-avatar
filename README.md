@@ -10,13 +10,13 @@
 
 | 階段 | 模型 / 工具 | 用途與特點 | 備註 |
 | :--- | :--- | :--- | :--- |
-| **1. 語音合成 (TTS)** | **CosyVoice2-Yue** (`jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx`) | 粵語零樣本聲線複製（Zero-shot Voice Cloning），產出高自然度粵語主播音軌 | 需搭配 `--ref_audio` 與 `--ref_text` 獨立生成 WAV 後以 `--audio` 傳入 |
+| **1. 語音合成 (TTS)** | **CosyVoice2-Yue** (`jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx`) | 單進程分句粵語零樣本聲線複製，自動補參考音尾靜音防殘音，輸出 24kHz 原聲與毫秒級字幕時間軸 | 由 `cosy_batch_tts.py` 載入模型一次完成全部短句合成 |
 | | **macOS `say`** (`Sinji` 粵語 / `Tingting` 國語) | 系統內建離線語音合成 | 透過 `--voice Sinji` 直接調用 |
 | | **Edge TTS** (`edge-tts`) | 微軟雲端免費神經網路語音 | 透過 `--voice edge:zh-HK-HiuGaaiNeural` 調用 |
-| **2. 人臉偵測與關鍵點** | **InsightFace** (`buffalo_l` / 68 點人臉特徵點) | 精準定位人臉邊界、眼睛輪廓與下半臉嘴部區域 | 用於 68 點下半臉凸包遮罩（Convex Hull）與自然眨眼/頭部微動控制 |
-| **3. 口型同步 (Lip-Sync)** | **Wav2Lip-GAN** (`wav2lip_gan.pth`) | 根據 16kHz 音訊梅爾頻譜（Mel-spectrogram）驅動嘴唇開合 | 啟用時序平滑並收緊下巴 padding（`0 10 0 0`），貼合語音節奏 |
-| **4. 畫質高清修復** | **GFPGAN v1.4** (`GFPGANv1.4.pth`) | 修復 Wav2Lip 嘴部區域的像素模糊與鋸齒，還原皮膚與牙齒細節 | 預設於 CPU 執行以防 8GB 記憶體溢出，可透過 `--gfpgan-weight` 調整混合權重 |
-| **5. 音畫處理與封裝** | **FFmpeg** (`libx264` / `aac`) | 16kHz 單聲道音訊正規化、偶數寬高裁切、音畫延遲校準與 MP4 封裝 | 預設音訊延遲 `120ms` 對齊中文發音起音 |
+| **2. 人臉偵測與關鍵點** | **InsightFace** (`buffalo_l` Lite：`detection` + `landmark_3d_68`) | 僅於原圖執行單次偵測取得臉框、雙眼與 68 點下顎多邊形，後續各幀以精準仿射矩陣追蹤 | 徹底消除逐幀 ONNX 與 S3FD 推論耗時與抖動 |
+| **3. 口型同步 (Lip-Sync)** | **Wav2Lip-GAN** (`wav2lip_gan.pth`) | 串流分批（預設 batch=32）於 **Apple MPS / CUDA / CPU** 直接推論，零 6 秒硬切與零 OOM | 預設下巴邊距 `--pads 0 16 8 8` 防左下唇偏移 |
+| **4. 畫質修復與融合** | **快速 LAB 色彩對齊 + Unsharp 銳化** / **MPS GFPGAN v1.4** (`--hd`) | 預設以 LAB 膚色對齊 + 嘴周銳化消除 96×96 糊嘴；開啟 `--hd` 時於 MPS 執行 GFPGAN 並自動跳過靜音幀 | 搭配自適應軟羽化 68 點下半臉凸包與 RMS 靜音停頓平滑過渡 |
+| **5. 字幕與單次直出** | **快取 RGBA 字幕 + FFmpeg** (`libx264` / `aac 192k`) | 每句字幕僅渲染一次並快取，直接透過 Raw BGR Pipe 單次編碼直出，保留原始 24kHz+ 高清音訊與 `120ms` 口型對齊 | 零中間有損壓縮、支援 `+faststart` 秒開播放 |
 
 ---
 
@@ -146,10 +146,12 @@ python generate.py --image your_photo.jpg --text-file script.txt --output output
 | `--rate` | `185` | macOS `say` 語速（每分鐘字數） |
 | `--fps` | `25` | 輸出視頻幀率 |
 | `--breathing-amp` | `0.6` | 呼吸微動幅度（像素），設為 `0` 可關閉 |
-| `--gfpgan-weight` | `0.65` | GFPGAN 嘴部清晰化混合權重（`0` 可跳過以加速推論） |
-| `--pads` | `0 10 0 0` | Wav2Lip 臉部邊界擴展（上 下 左 右） |
+| `--gfpgan-weight` | `0.0` | GFPGAN 嘴部清晰化混合權重（`0` 使用快速 LAB 色彩對齊與銳化；`--hd` 為 `0.65` 並跳過靜音幀） |
+| `--pads` | `0 16 8 8` | Wav2Lip 臉部邊界擴展（上 下 左 右） |
 | `--audio-delay-ms` | `120` | 音訊延遲毫秒數，對齊中文發音起音 |
-| `--device` | `cpu` | GFPGAN 推論裝置（`cpu` 或 `cuda`；M1 8GB 建議用 `cpu` 防記憶體溢出） |
+| `--device` | `auto` | PyTorch 推論裝置（`auto` 自動優先選擇 `cuda` > Apple `mps` > `cpu`） |
+| `--batch-size` | `32` | 串流 Wav2Lip 批次大小（8GB 記憶體安全值，無須 6 秒硬切） |
+| `--subtitle-timeline` | `None` | 由 `cosy_batch_tts.py` 輸出的毫秒級精準字幕時間軸 JSON |
 | `--wav2lip-dir` | `./Wav2Lip` | Wav2Lip 專案目錄路徑（可由環境變數 `WAV2LIP_DIR` 指定） |
 | `--gfpgan-weights` | `./weights/GFPGANv1.4.pth` | GFPGAN 權重檔路徑（可由環境變數 `GFPGAN_WEIGHTS` 指定） |
 | `--insightface-root` | `~/.insightface` | InsightFace 模型根目錄（可由環境變數 `INSIGHTFACE_ROOT` 指定） |
