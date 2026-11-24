@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -21,32 +22,22 @@ import soundfile as sf
 from mlx_audio.tts.generate import generate_audio
 from mlx_audio.tts.utils import load_model
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from cantonese_tn import (
+    build_synced_subtitle_chunks,
+    normalize_cantonese_tts,
+    split_tts_segments,
+)
+
 COSY_MODEL = "jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx"
 
 
-def split_sentences(text: str, max_len: int = 38) -> list[str]:
-    """Split Traditional Chinese script into natural short sentences for stable TTS."""
-    clean = re.sub(r"\s+", "", text.strip())
-    if not clean:
-        return []
-    raw = [p.strip() for p in re.split(r"(?<=[。！？!?；;])", clean) if p.strip()]
-    out: list[str] = []
-    for sent in raw:
-        if len(sent) <= max_len:
-            out.append(sent)
-            continue
-        # Further split long sentences at commas while keeping punctuation
-        clauses = [c for c in re.split(r"(?<=[，,、])", sent) if c]
-        buf = ""
-        for c in clauses:
-            if buf and len(buf) + len(c) > max_len:
-                out.append(buf)
-                buf = c
-            else:
-                buf += c
-        if buf:
-            out.append(buf)
-    return out
+def split_sentences(text: str, max_len: int = 44) -> list[str]:
+    """Legacy helper returning display sentences from the balanced Cantonese splitter."""
+    return [seg["display_text"] for seg in split_tts_segments(text, max_speech_len=max_len)]
 
 
 def trim_and_clean_segment(
@@ -88,30 +79,9 @@ def trim_and_clean_segment(
     return audio
 
 
-def build_subtitle_chunks(sentence: str, start_sec: float, end_sec: float, max_chars: int = 22) -> list[dict]:
-    """Break a sentence into readable subtitle lines proportioned over its exact audio span."""
-    raw_parts = [p.strip() for p in re.split(r"[，。！？；、,\.\n]+", sentence) if p.strip()]
-    lines: list[str] = []
-    for part in raw_parts:
-        while len(part) > max_chars:
-            lines.append(part[:max_chars])
-            part = part[max_chars:]
-        if part:
-            lines.append(part)
-    if not lines:
-        return []
-    total_chars = sum(max(1, len(x)) for x in lines)
-    dur = max(0.05, end_sec - start_sec)
-    cursor = start_sec
-    entries = []
-    for i, line in enumerate(lines):
-        if i == len(lines) - 1:
-            seg_end = end_sec
-        else:
-            seg_end = cursor + dur * (len(line) / total_chars)
-        entries.append({"start": round(cursor, 3), "end": round(seg_end, 3), "text": line})
-        cursor = seg_end
-    return entries
+def build_subtitle_chunks(sentence: str, start_sec: float, end_sec: float, max_chars: int = 24) -> list[dict]:
+    """Break a display sentence into readable subtitle lines weighted by spoken Cantonese syllables."""
+    return build_synced_subtitle_chunks(sentence, start_sec, end_sec, max_chars=max_chars)
 
 
 def main() -> None:
@@ -122,14 +92,15 @@ def main() -> None:
     parser.add_argument("--output-wav", required=True, help="Output 24kHz WAV path.")
     parser.add_argument("--output-timeline", help="Optional output JSON timeline path for synced subtitles.")
     parser.add_argument("--model", default=COSY_MODEL, help="MLX CosyVoice2 model repo/path.")
-    parser.add_argument("--pause-sec", type=float, default=0.22, help="Pause duration between sentences.")
+    parser.add_argument("--pause-sec", type=float, default=0.22, help="Pause duration between full sentences.")
+    parser.add_argument("--clause-pause-sec", type=float, default=0.08, help="Short breath pause between split clauses.")
     parser.add_argument("--ref-pad-sec", type=float, default=0.30, help="Trailing silence padded to ref audio.")
     parser.add_argument("--lead-trim-sec", type=float, default=0.0, help="Fixed leading trim per segment (sec).")
     parser.add_argument("--speed", type=float, default=1.0, help="Speech speed multiplier.")
     args = parser.parse_args()
 
-    sentences = split_sentences(args.text)
-    if not sentences:
+    segments = split_tts_segments(args.text)
+    if not segments:
         raise ValueError("Empty input text.")
 
     with tempfile.TemporaryDirectory(prefix="cosy_batch_") as tmp:
@@ -147,13 +118,19 @@ def main() -> None:
         all_audio: list[np.ndarray] = []
         timeline: list[dict] = []
         cur_sec = 0.0
-        pause_samples = np.zeros(int(sr * args.pause_sec), dtype=np.float32)
 
-        for idx, sent in enumerate(sentences):
+        for idx, seg in enumerate(segments):
+            display_sent = seg["display_text"]
+            tts_sent = seg["tts_text"]
+            pause_kind = seg["pause_after"]
             prefix = str(tmp_dir / f"seg_{idx:02d}")
-            print(f"[CosyVoice2-Yue] ({idx + 1}/{len(sentences)}) {sent}")
+            if tts_sent != display_sent:
+                print(f"[CosyVoice2-Yue] ({idx + 1}/{len(segments)}) {display_sent}  -->  [TTS] {tts_sent}")
+            else:
+                print(f"[CosyVoice2-Yue] ({idx + 1}/{len(segments)}) {display_sent}")
+
             generate_audio(
-                text=sent,
+                text=tts_sent,
                 model=model,
                 ref_audio=str(ref_pad),
                 ref_text=args.ref_text,
@@ -172,17 +149,19 @@ def main() -> None:
             data, seg_sr = sf.read(str(seg_wav))
             if seg_sr != sr:
                 sr = seg_sr
-                pause_samples = np.zeros(int(sr * args.pause_sec), dtype=np.float32)
 
             cleaned = trim_and_clean_segment(data, sr, lead_trim_sec=args.lead_trim_sec)
             seg_dur = len(cleaned) / float(sr)
-            timeline.extend(build_subtitle_chunks(sent, cur_sec, cur_sec + seg_dur))
+            timeline.extend(build_subtitle_chunks(display_sent, cur_sec, cur_sec + seg_dur))
             all_audio.append(cleaned)
             cur_sec += seg_dur
 
-            if idx < len(sentences) - 1 and len(pause_samples) > 0:
-                all_audio.append(pause_samples)
+            if pause_kind == "sentence" and args.pause_sec > 0:
+                all_audio.append(np.zeros(int(sr * args.pause_sec), dtype=np.float32))
                 cur_sec += args.pause_sec
+            elif pause_kind == "clause" and args.clause_pause_sec > 0:
+                all_audio.append(np.zeros(int(sr * args.clause_pause_sec), dtype=np.float32))
+                cur_sec += args.clause_pause_sec
 
         # Gentle peak normalization (-1 dBFS) for crisp broadcast loudness
         full = np.concatenate(all_audio, axis=0)

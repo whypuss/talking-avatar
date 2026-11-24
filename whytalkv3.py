@@ -108,6 +108,7 @@ def main() -> None:
     parser.add_argument("--ref-text", help="Custom reference audio transcript.")
     parser.add_argument("--speed", type=float, default=1.0, help="TTS speech speed multiplier (default: 1.0).")
     parser.add_argument("--fps", type=int, default=25, help="Output video FPS (default: 25).")
+    parser.add_argument("--breathing-amp", type=float, default=0.6, help="Head motion amplitude scale (0 to disable, default: 0.6).")
     parser.add_argument("--device", default="auto", help="PyTorch device: auto (mps/cuda/cpu), mps, cuda, or cpu.")
     parser.add_argument("--batch-size", type=int, default=32, help="Streaming Wav2Lip batch size (default: 32).")
     parser.add_argument("--output", default=str(REPO_DIR / "output" / "whytalkv3_out.mp4"), help="Output MP4 path.")
@@ -160,6 +161,7 @@ def main() -> None:
                 "--image", args.image,
                 "--audio", audio_wav,
                 "--fps", str(args.fps),
+                "--breathing-amp", str(args.breathing_amp),
                 "--device", args.device,
                 "--batch-size", str(args.batch_size),
                 "--gfpgan-weight", gfpgan_w,

@@ -24,7 +24,7 @@ cd ~/projects/whytalk && .venv/bin/python whytalkv3.py \
 
 | 階段 | 模型 / 工具 | 用途與特點 | 備註 |
 | :--- | :--- | :--- | :--- |
-| **1. 語音合成 (TTS)** | **CosyVoice2-Yue** (`jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx`) | 單進程分句粵語零樣本聲線複製，自動補參考音尾靜音防殘音，輸出 24kHz 原聲與毫秒級字幕時間軸 | 由 `cosy_batch_tts.py` 載入模型一次完成全部短句合成 |
+| **1. 語音合成 (TTS)** | **CosyVoice2-Yue** (`jackuh02/CosyVoice2-Yue-ZoengJyutGaai-mlx`) | 單進程分句粵語零樣本聲線複製；內建 `cantonese_tn.py` 雙軌正規化（發音自動展開數字/小數/百分比/年份，字幕保留原始新聞排版且絕不切斷小數點），輸出 24kHz 原聲與音節加權同步字幕時間軸 | 由 `cosy_batch_tts.py` 載入模型一次完成全部均衡分句合成 |
 | | **macOS `say`** (`Sinji` 粵語 / `Tingting` 國語) | 系統內建離線語音合成 | 透過 `--voice Sinji` 直接調用 |
 | | **Edge TTS** (`edge-tts`) | 微軟雲端免費神經網路語音 | 透過 `--voice edge:zh-HK-HiuGaaiNeural` 調用 |
 | **2. 人臉偵測與關鍵點** | **InsightFace** (`buffalo_l` Lite：`detection` + `landmark_3d_68`) | 僅於原圖執行單次偵測取得臉框、雙眼與 68 點下顎多邊形，後續各幀以精準仿射矩陣追蹤 | 徹底消除逐幀 ONNX 與 S3FD 推論耗時與抖動 |

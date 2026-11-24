@@ -123,14 +123,14 @@ def detect_face_once(img: np.ndarray, insightface_root: str) -> dict:
     fw, fh = x2 - x1, y2 - y1
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
-    pivot = (cx, min(float(h - 1), y2 + fh * 0.25))
+    pivot = (cx, min(float(h - 1), y2 + fh * 0.34))
 
-    # Soft elliptical head+hair mask so only the head sways while studio background stays locked
+    # Soft elliptical head+hair mask so only the head sways smoothly while studio background stays locked
     yy, xx = np.ogrid[:h, :w]
-    rx, ry = fw * 0.95, fh * 1.15
-    dist = ((xx - cx) / max(1.0, rx)) ** 2 + ((yy - (cy - fh * 0.08)) / max(1.0, ry)) ** 2
-    mask = np.clip(1.35 - dist, 0.0, 1.0).astype(np.float32)
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(5.0, fw * 0.08))
+    rx, ry = fw * 1.04, fh * 1.22
+    dist = ((xx - cx) / max(1.0, rx)) ** 2 + ((yy - (cy - fh * 0.06)) / max(1.0, ry)) ** 2
+    mask = np.clip(1.40 - dist, 0.0, 1.0).astype(np.float32)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(7.0, fw * 0.10))
     head_mask = mask[..., None]
 
     # Precompute eye ROI boxes and soft elliptical masks once
@@ -178,7 +178,15 @@ def compute_motion_trajectory(
     fps: int,
     amp: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
-    """Precompute continuous news-anchor head trajectory and slow natural blink schedule."""
+    """
+    Precompute calm, natural broadcast-anchor head motion and organic blink schedule.
+
+    Design goals:
+      - Low-frequency, restrained nod cadence (~6-9/min, never bobbing every second)
+      - Organic, non-periodic subtle head tilt with critically damped 2nd-order smoothing
+      - Gentle breathing + ultra-slow posture sway so quiet stretches stay alive, never robotic
+      - Rare, gentle glance-down only at natural speech pauses in longer broadcasts
+    """
     rms_env = np.ones(total_frames, dtype=np.float32)
     if audio_16k and os.path.exists(audio_16k):
         try:
@@ -196,58 +204,130 @@ def compute_motion_trajectory(
         except Exception:
             pass
 
+    dt = 1.0 / float(max(1, fps))
+    rng = np.random.default_rng(20261124)
+
     dx_arr = np.zeros(total_frames, dtype=np.float32)
     dy_arr = np.zeros(total_frames, dtype=np.float32)
     ang_arr = np.zeros(total_frames, dtype=np.float32)
 
-    cur_dy, cur_ang, tgt_ang = 0.0, 0.0, 0.0
-    tilt_timer, nod_timer, nod_cooldown = 0, 0, 0
-    tilt_dir = 1.0
-    glance_frame = int(min(9.0 * fps, total_frames * 0.83)) if total_frames > int(2.5 * fps) else -1
+    # 2nd-order critically damped spring states for ultra-smooth, jerk-free head movement
+    cur_ang, vel_ang, tgt_ang = 0.0, 0.0, 0.0
+    cur_dy, vel_dy = 0.0, 0.0
+    omega_ang = 1.55   # ~2.0s smooth settle time for subtle tilt
+    omega_dy = 4.2     # ~0.75s smooth settle time for gentle nods
+
+    # Organic timers (in frames)
+    nod_timer, nod_dur_frames = 0, int(fps * 0.80)
+    nod_amp_px = 0.0
+    nod_cooldown = int(fps * float(rng.uniform(2.0, 3.2)))
+    silent_run = 0
+
+    tilt_hold = 0
+    tilt_cooldown = int(fps * float(rng.uniform(4.0, 6.5)))
+    tilt_dir = 1.0 if float(rng.random()) > 0.5 else -1.0
+
+    glance_timer, glance_dur_frames = 0, int(fps * 1.15)
+    glance_cooldown = int(fps * float(rng.uniform(22.0, 30.0)))
 
     for idx in range(total_frames):
+        t = idx * dt
         e = float(rms_env[idx])
-        is_speaking = e > 0.15
+        is_speaking = e > 0.14
 
+        if is_speaking:
+            came_from_pause = silent_run >= int(fps * 0.18)
+            silent_run = 0
+        else:
+            came_from_pause = False
+            silent_run += 1
+
+        # 1. Restrained micro-nods: only on phrase restarts or rare strong emphasis, every ~5-8s
         if nod_cooldown > 0:
             nod_cooldown -= 1
-        if is_speaking and nod_cooldown == 0 and (idx == 0 or rms_env[idx - 1] <= 0.15 or e > 0.70):
-            nod_timer = int(fps * 0.42)
-            nod_cooldown = int(fps * 0.90)
+        elif is_speaking and nod_timer == 0 and glance_timer == 0:
+            if came_from_pause or (e > 0.80 and idx > int(fps * 2.0)):
+                nod_dur_frames = int(fps * float(rng.uniform(0.76, 1.00)))
+                nod_timer = nod_dur_frames
+                nod_amp_px = float(rng.uniform(1.15, 1.75)) * amp
+                nod_cooldown = int(fps * float(rng.uniform(5.2, 8.2)))
 
-        if tilt_timer > 0:
-            tilt_timer -= 1
-            if tilt_timer == 0:
+        # 2. Subtle non-periodic head tilt: every ~8-14s, small amplitude (<= 1.0 deg), sometimes returns to neutral
+        if tilt_hold > 0:
+            tilt_hold -= 1
+            if tilt_hold == 0:
                 tgt_ang = 0.0
-        elif is_speaking and idx > 0 and idx % int(fps * 2.8) == 0:
-            tgt_ang = tilt_dir * min(3.2, 2.0 * amp)
-            tilt_dir *= -1.0
-            tilt_timer = int(fps * 1.1)
+                tilt_cooldown = int(fps * float(rng.uniform(6.5, 11.5)))
+        elif tilt_cooldown > 0:
+            tilt_cooldown -= 1
+        elif is_speaking:
+            # 25% chance to stay centered a bit longer instead of alternating like a metronome
+            if float(rng.random()) < 0.25:
+                tgt_ang = 0.0
+                tilt_cooldown = int(fps * float(rng.uniform(4.5, 7.5)))
+            else:
+                mag = min(1.05, float(rng.uniform(0.80, 1.35)) * amp)
+                tgt_ang = tilt_dir * mag
+                tilt_dir *= -1.0 if float(rng.random()) < 0.78 else 1.0
+                tilt_hold = int(fps * float(rng.uniform(3.2, 5.2)))
 
-        glance_dy = 0.0
-        if glance_frame > 0 and glance_frame <= idx < glance_frame + int(fps * 0.65):
-            gp = (idx - glance_frame) / max(1.0, fps * 0.65)
-            glance_dy = 3.5 * amp * math.sin(math.pi * gp)
+        # 3. Rare soft glance-down at natural sentence pauses (only in broadcasts > 25s)
+        if glance_cooldown > 0:
+            glance_cooldown -= 1
+        elif (
+            total_frames > int(fps * 25.0)
+            and glance_timer == 0
+            and nod_timer == 0
+            and silent_run >= int(fps * 0.16)
+            and idx < total_frames - int(fps * 3.0)
+        ):
+            glance_dur_frames = int(fps * float(rng.uniform(1.05, 1.35)))
+            glance_timer = glance_dur_frames
+            glance_cooldown = int(fps * float(rng.uniform(30.0, 42.0)))
 
-        cur_ang += (tgt_ang - cur_ang) * 0.10
-
+        # Evaluate smooth sin^2 pulse envelopes (zero velocity at start & end -> zero jerk)
         nod_dy = 0.0
         if nod_timer > 0:
-            p = 1.0 - (nod_timer / max(1.0, fps * 0.42))
-            nod_dy = 1.8 * amp * math.sin(math.pi * (p ** 0.65))
+            p = 1.0 - (nod_timer / float(max(1, nod_dur_frames)))
+            nod_dy = nod_amp_px * (math.sin(math.pi * p) ** 2)
             nod_timer -= 1
 
-        cur_dy += ((nod_dy + glance_dy) - cur_dy) * 0.35
+        glance_dy = 0.0
+        if glance_timer > 0:
+            gp = 1.0 - (glance_timer / float(max(1, glance_dur_frames)))
+            glance_dy = (1.65 * amp) * (math.sin(math.pi * gp) ** 2)
+            glance_timer -= 1
+
+        # Continuous ultra-gentle physiological breathing & posture micro-drift
+        breath_dy = 0.28 * amp * math.sin(2.0 * math.pi * t / 4.8)
+        drift_dx = 0.45 * amp * (
+            0.65 * math.sin(2.0 * math.pi * t / 13.7 + 0.4)
+            + 0.35 * math.sin(2.0 * math.pi * t / 23.1 + 1.9)
+        )
+        drift_ang = 0.14 * amp * math.sin(2.0 * math.pi * t / 17.3 + 0.7)
+
+        # Critically damped spring update for angle
+        acc_ang = (omega_ang ** 2) * ((tgt_ang + drift_ang) - cur_ang) - 2.0 * omega_ang * vel_ang
+        vel_ang += acc_ang * dt
+        cur_ang += vel_ang * dt
+
+        # Critically damped spring update for vertical motion
+        tgt_dy = nod_dy + glance_dy + breath_dy
+        acc_dy = (omega_dy ** 2) * (tgt_dy - cur_dy) - 2.0 * omega_dy * vel_dy
+        vel_dy += acc_dy * dt
+        cur_dy += vel_dy * dt
+
+        dx_arr[idx] = drift_dx
         dy_arr[idx] = cur_dy
         ang_arr[idx] = cur_ang
 
-    # Natural slow blink schedule (start at 3.0s, never at 0s, then every ~6.5s)
+    # Organic slow blink schedule (never at 0s, start around 3.2s, varied natural 4.8-7.4s intervals)
     duration = total_frames / float(fps)
-    blink_times = [3.0, 9.5]
-    t_next = 16.0
-    while t_next < duration + 1.0:
-        blink_times.append(t_next)
-        t_next += 6.5
+    blink_times: list[float] = []
+    t_next = 3.2
+    while t_next < duration - 0.5:
+        blink_times.append(round(t_next, 2))
+        t_next += float(rng.uniform(4.8, 7.4))
 
     return dx_arr, dy_arr, ang_arr, blink_times
 
@@ -276,11 +356,15 @@ def render_base_frame(
         blink_amt = 0.0
         for bt in blink_times:
             dt = t - bt
-            if -0.07 <= dt <= 0.11:
-                blink_amt = max(0.0, min(1.0, 1.0 - abs(dt / (0.07 if dt < 0 else 0.11))))
+            if -0.065 <= dt <= 0.105:
+                blink_amt = max(0.0, min(1.0, 1.0 - abs(dt / (0.065 if dt < 0 else 0.105))))
                 break
-        saccade_x = 0.8 * math.sin(2.0 * math.pi * 0.85 * t)
-        if blink_amt > 0.02 or abs(saccade_x) > 0.05:
+        # Very subtle, slow teleprompter gaze micro-drift (no high-frequency jitter)
+        saccade_x = 0.30 * (
+            0.60 * math.sin(2.0 * math.pi * 0.21 * t)
+            + 0.40 * math.sin(2.0 * math.pi * 0.35 * t + 1.1)
+        )
+        if blink_amt > 0.02 or abs(saccade_x) > 0.06:
             src_img = img.copy()
             for ex1, ey1, ex2, ey2, emask in eye_items:
                 roi = img[ey1:ey2, ex1:ex2]
@@ -296,7 +380,7 @@ def render_base_frame(
                     255,
                 ).astype(np.uint8)
 
-    scale = 1.0 + 0.0015 * math.sin(2.0 * math.pi * 0.25 * t)
+    scale = 1.0 + 0.0009 * amp * math.sin(2.0 * math.pi * t / 4.8)
     mat = cv2.getRotationMatrix2D(face_info["pivot"], float(ang), scale)
     mat[0, 2] += float(dx)
     mat[1, 2] += float(dy)
@@ -367,16 +451,20 @@ def enhance_mouth_fast(pred_patch: np.ndarray, base_patch: np.ndarray) -> np.nda
     return sharp
 
 
-def _split_subtitle_segments(text: str, max_chars: int = 22) -> list[str]:
-    raw_parts = [p.strip() for p in re.split(r"[，。！？；、,\.\n]+", text) if p.strip()]
-    segments: list[str] = []
-    for part in raw_parts:
-        while len(part) > max_chars:
-            segments.append(part[:max_chars])
-            part = part[max_chars:]
-        if part:
-            segments.append(part)
-    return segments or [text.strip()]
+def _split_subtitle_segments(text: str, max_chars: int = 24) -> list[str]:
+    try:
+        from cantonese_tn import split_subtitle_lines
+        return split_subtitle_lines(text, max_chars=max_chars) or [text.strip()]
+    except Exception:
+        raw_parts = [p.strip() for p in re.split(r"(?:[，。！？；、\n]|(?<!\d)[,\.](?!\d))+", text) if p.strip()]
+        segments: list[str] = []
+        for part in raw_parts:
+            while len(part) > max_chars:
+                segments.append(part[:max_chars])
+                part = part[max_chars:]
+            if part:
+                segments.append(part)
+        return segments or [text.strip()]
 
 
 def _load_tc_font(font_size: int):
