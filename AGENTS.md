@@ -14,3 +14,12 @@ cd ~/projects/whytalk && .venv/bin/python whytalkv3.py \
 - 預設啟用 1-shot MPS GFPGAN v1.4 高清嘴部還原＋原圖唇色鎖定（`--gfpgan-weight 0.60`）與克制自然頭部微動（`--breathing-amp 0.6`）；超長片若需極速預覽可加 `--fast`（關閉 GFPGAN 但仍保留唇色鎖定與文字口型微調）。
 - 若使用者提供現成音訊檔，改傳 `--audio "<音訊路徑>"`（可搭配 `--subtitle-text "<字幕>"` 或 `--subtitle-timeline "<timeline.json>"`）。
 - 舊路徑 `whytalkv2.py` 保留為相容轉發入口，自動轉交 `whytalkv3.py` 執行。
+- 當使用者要求「用 **whypv2** 製作視頻」（雙圖新聞播報：圖 1 主播 ＋ 圖 2 現場照片插播 ＋ 預設敏感詞字幕過濾為 `xx`）時，執行獨立入口 `whypv2.py`：
+  ```bash
+  cd ~/projects/whytalk && .venv/bin/python whypv2.py \
+    --image "<圖1 主播圖片>" \
+    --image2 "<圖2 現場圖片>" \
+    --text "<繁體中文新聞口播內容>" \
+    --voice-ref 女主播h \
+    --output output/whypv2_out.mp4
+  ```
