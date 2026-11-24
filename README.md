@@ -1,4 +1,6 @@
-# whytalkv3 (全畫面高清串流 MPS 對口型數字人)
+# whytalkv3 (全畫面高清串流 MPS 對口型數字人) — `whyv1` 穩定版
+
+> **當前穩定里程碑版本**：`whyv1`（CosyVoice2-Yue 粵語數字／百分比正規化雙軌＋均衡防截斷切片＋Apple MPS 零硬切串流 Wav2Lip-GAN＋低頻自然二階平滑頭部動作＋24kHz 原聲直出）
 
 將任意人像圖片與文字（或預先合成的音訊）轉換成**保留完整原始構圖、自然呼吸微動、自然頭部與眨眼動作、高清嘴部與毫秒級同步字幕**的 MP4 講話視頻。專為 **Apple Silicon (M1/M2 8GB 統一記憶體)** 深度最佳化，採用單進程分句 CosyVoice2-Yue + 零硬切串流 Apple MPS Wav2Lip-GAN 架構。
 
