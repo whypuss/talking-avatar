@@ -121,6 +121,11 @@ def main() -> None:
     parser.add_argument("--hd", action="store_true", help="Enable 1-shot MPS GFPGAN v1.4 HD mouth restoration (enabled by default).")
     parser.add_argument("--fast", action="store_true", help="Disable GFPGAN for ultra-fast preview (still keeps lip color lock & text visemes).")
     parser.add_argument("--no-subtitles", action="store_true", help="Disable Traditional Chinese subtitles.")
+    parser.add_argument("--censor-subtitles", action="store_true", help="Mask sensitive words (e.g. 自殺/輕生) as 'xx' on subtitles.")
+    parser.add_argument("--broll-image", help="Optional B-roll / news scene image to smoothly display mid-video.")
+    parser.add_argument("--broll-start", type=float, help="B-roll start timestamp in seconds.")
+    parser.add_argument("--broll-end", type=float, help="B-roll end timestamp in seconds.")
+    parser.add_argument("--broll-label", help="Optional corner badge text on B-roll (e.g. 現場畫面).")
     args = parser.parse_args()
 
     if not args.audio and not args.text:
@@ -173,6 +178,16 @@ def main() -> None:
                     cmd.extend(["--subtitle-timeline", timeline_path])
                 elif sub_full:
                     cmd.extend(["--subtitle-text", sub_full])
+                if args.censor_subtitles:
+                    cmd.append("--censor-subtitles")
+            if args.broll_image:
+                cmd.extend(["--broll-image", args.broll_image])
+                if args.broll_start is not None:
+                    cmd.extend(["--broll-start", str(args.broll_start)])
+                if args.broll_end is not None:
+                    cmd.extend(["--broll-end", str(args.broll_end)])
+                if args.broll_label:
+                    cmd.extend(["--broll-label", args.broll_label])
             run_cmd(cmd, cwd=str(REPO_DIR))
         else:
             print(f"=== [2/3] Splitting {duration:.1f}s audio into {args.chunk_sec}s chunks ===")

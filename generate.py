@@ -713,6 +713,114 @@ def _load_tc_font(font_size: int):
     return ImageFont.load_default()
 
 
+class BrollOverlay:
+    """
+    Smooth broadcast B-roll image cut-in with automatic white-border trimming,
+    aspect-preserving cover crop, subtle Ken Burns zoom, smooth sin^2 crossfade,
+    and optional subtle corner badge.
+    """
+
+    def __init__(
+        self,
+        image_path: str,
+        width: int,
+        height: int,
+        start_sec: float,
+        end_sec: float,
+        fade_sec: float = 0.45,
+        label: str | None = None,
+    ) -> None:
+        raw = cv2.imread(image_path)
+        if raw is None:
+            raise FileNotFoundError(f"Could not read B-roll image: {image_path}")
+        raw = self._trim_white_borders(raw)
+
+        self.w = width
+        self.h = height
+        self.start_sec = float(start_sec)
+        self.end_sec = float(end_sec)
+        self.fade_sec = max(0.05, float(fade_sec))
+
+        # Pre-scale to 1.07x target canvas (cover crop) for crisp Ken Burns slow push-in
+        pad_scale = 1.07
+        tw, th = int(round(width * pad_scale)), int(round(height * pad_scale))
+        rh, rw = raw.shape[:2]
+        scale = max(tw / float(rw), th / float(rh))
+        nw, nh = int(round(rw * scale)), int(round(rh * scale))
+        resized = cv2.resize(raw, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
+        x0 = max(0, (nw - tw) // 2)
+        y0 = max(0, (nh - th) // 2)
+        self.canvas = resized[y0 : y0 + th, x0 : x0 + tw].copy()
+        self.tw, self.th = self.canvas.shape[1], self.canvas.shape[0]
+        self.badge = self._build_badge(label) if label else None
+
+    @staticmethod
+    def _trim_white_borders(img: np.ndarray) -> np.ndarray:
+        """Auto-strip pure white scanner/screenshot borders (common on news agency photos)."""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        non_white = gray < 246
+        rows = np.where(non_white.mean(axis=1) > 0.15)[0]
+        cols = np.where(non_white.mean(axis=0) > 0.15)[0]
+        if len(rows) > 20 and len(cols) > 20:
+            y1, y2 = int(rows[0]), int(rows[-1]) + 1
+            x1, x2 = int(cols[0]), int(cols[-1]) + 1
+            # Slight extra 2px shave to avoid faint anti-aliased white edge
+            y1 = min(y2 - 20, y1 + 2)
+            x1 = min(x2 - 20, x1 + 2)
+            y2 = max(y1 + 20, y2 - 2)
+            x2 = max(x1 + 20, x2 - 2)
+            return img[y1:y2, x1:x2]
+        return img
+
+    def _build_badge(self, label: str):
+        from PIL import Image, ImageDraw
+
+        font = _load_tc_font(max(18, int(self.w * 0.019)))
+        dummy = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(dummy)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        pad_x, pad_y = 14, 7
+        bw, bh = tw + pad_x * 2, th + pad_y * 2
+        strip = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+        sdraw = ImageDraw.Draw(strip)
+        sdraw.rounded_rectangle([0, 0, bw - 1, bh - 1], radius=6, fill=(14, 22, 38, 175))
+        sdraw.text((pad_x - bbox[0], pad_y - bbox[1]), label, font=font, fill=(245, 248, 255, 245))
+        rgba = np.array(strip)
+        bgr = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR).astype(np.float32)
+        alpha = rgba[:, :, 3:4].astype(np.float32) / 255.0
+        bx1, by1 = int(self.w * 0.03), int(self.h * 0.04)
+        return (bx1, by1, bx1 + bw, by1 + bh, bgr, alpha)
+
+    def alpha_at(self, t_sec: float) -> float:
+        if t_sec <= self.start_sec or t_sec >= self.end_sec:
+            return 0.0
+        if t_sec < self.start_sec + self.fade_sec:
+            p = (t_sec - self.start_sec) / self.fade_sec
+            return float(math.sin(0.5 * math.pi * p) ** 2)
+        if t_sec > self.end_sec - self.fade_sec:
+            p = (self.end_sec - t_sec) / self.fade_sec
+            return float(math.sin(0.5 * math.pi * p) ** 2)
+        return 1.0
+
+    def render_frame(self, t_sec: float) -> np.ndarray:
+        span = max(0.5, self.end_sec - self.start_sec)
+        prog = float(np.clip((t_sec - self.start_sec) / span, 0.0, 1.0))
+        # Gentle Ken Burns zoom from 1.00 -> 1.055
+        zoom = 1.0 + 0.055 * prog
+        crop_w = int(round(self.tw / zoom))
+        crop_h = int(round(self.th / zoom))
+        x0 = max(0, (self.tw - crop_w) // 2)
+        y0 = max(0, (self.th - crop_h) // 2)
+        view = self.canvas[y0 : y0 + crop_h, x0 : x0 + crop_w]
+        frame = cv2.resize(view, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+        if self.badge is not None:
+            bx1, by1, bx2, by2, bgr, alpha = self.badge
+            roi = frame[by1:by2, bx1:bx2].astype(np.float32)
+            frame[by1:by2, bx1:bx2] = np.clip(bgr * alpha + roi * (1.0 - alpha), 0, 255).astype(np.uint8)
+        return frame
+
+
 class SubtitleRenderer:
     """Pre-renders each unique subtitle line once as a cropped BGR+alpha strip for ~15x faster compositing."""
 
@@ -725,6 +833,7 @@ class SubtitleRenderer:
         audio_delay_ms: int = 120,
         subtitle_text: str | None = None,
         timeline_json: str | None = None,
+        censor_subtitles: bool = False,
     ) -> None:
         self.w = width
         self.h = height
@@ -734,11 +843,21 @@ class SubtitleRenderer:
         self.cache: dict[str, tuple[int, int, int, int, np.ndarray, np.ndarray]] = {}
         self.font = None
 
+        censor_fn = None
+        if censor_subtitles:
+            try:
+                from cantonese_tn import censor_subtitle_text
+                censor_fn = censor_subtitle_text
+            except Exception:
+                censor_fn = None
+
         if timeline_json and os.path.exists(timeline_json):
             data = json.loads(Path(timeline_json).read_text(encoding="utf-8"))
             for item in data:
                 txt = str(item.get("text", "")).strip()
                 if txt:
+                    if censor_fn is not None:
+                        txt = censor_fn(txt)
                     self.entries.append((float(item["start"]), float(item["end"]), txt))
         elif subtitle_text:
             segments = _split_subtitle_segments(subtitle_text)
@@ -750,7 +869,8 @@ class SubtitleRenderer:
                     end_sec = total_sec
                 else:
                     end_sec = cursor + total_sec * (len(seg) / total_chars)
-                self.entries.append((cursor, end_sec, seg))
+                disp = censor_fn(seg) if censor_fn is not None else seg
+                self.entries.append((cursor, end_sec, disp))
                 cursor = end_sec
 
         if self.entries:
@@ -876,6 +996,11 @@ def stream_generate_video(
     batch_size: int = 32,
     subtitle_text: str | None = None,
     subtitle_timeline: str | None = None,
+    censor_subtitles: bool = False,
+    broll_image: str | None = None,
+    broll_start: float | None = None,
+    broll_end: float | None = None,
+    broll_label: str | None = None,
 ) -> None:
     """Single-pass streaming Wav2Lip-GAN + blend + subtitles + FFmpeg encode."""
     t_start = time.time()
@@ -944,7 +1069,19 @@ def stream_generate_video(
         audio_delay_ms=audio_delay_ms,
         subtitle_text=subtitle_text,
         timeline_json=subtitle_timeline,
+        censor_subtitles=censor_subtitles,
     )
+
+    broll_overlay = None
+    if broll_image and os.path.exists(broll_image):
+        total_dur_sec = total_frames / float(fps)
+        bs = float(broll_start) if broll_start is not None else min(4.0, total_dur_sec * 0.15)
+        be = float(broll_end) if broll_end is not None else min(total_dur_sec - 1.5, bs + min(10.0, total_dur_sec * 0.30))
+        if be > bs + 0.5:
+            broll_overlay = BrollOverlay(
+                broll_image, w, h, start_sec=bs, end_sec=be, label=broll_label
+            )
+            print(f"B-roll overlay enabled: {bs:.2f}s -> {be:.2f}s ({broll_image})")
 
     print(f"=== [3/4] Loading Wav2Lip-GAN on {device} ===")
     w2l_model = load_wav2lip_model(wav2lip_dir, device)
@@ -1045,74 +1182,85 @@ def stream_generate_video(
             # Blend each frame & stream straight to FFmpeg
             for j in range(b_len):
                 frame_idx = b_start + j
-                bf = base_frames[j]
-                mat = mats_list[j]
-                fy1, fy2, fx1, fx2 = coords_list[j]
-                w_speak = float(speak_weights[frame_idx])
-                jaw_poly = jaw_polys[j]
+                t_sec = frame_idx / float(fps)
+                b_alpha = broll_overlay.alpha_at(t_sec) if broll_overlay is not None else 0.0
 
-                if w_speak <= 0.02:
-                    # Pure silence frame: zero blend & skip GFPGAN entirely
-                    final_frame = bf
+                if b_alpha >= 0.995 and broll_overlay is not None:
+                    # Full B-roll cut-in: bypass anchor GFPGAN/lip blend entirely (faster & 100% crisp)
+                    final_frame = broll_overlay.render_frame(t_sec)
                 else:
-                    p_up = cv2.resize(pred_np[j], (fx2 - fx1, fy2 - fy1), interpolation=cv2.INTER_CUBIC)
-                    outer_lip_local = None
-                    if outer_lip_base is not None:
-                        ol_t = cv2.transform(outer_lip_base, mat).reshape(-1, 2)
-                        outer_lip_local = ol_t - np.array([fx1, fy1], dtype=np.float32)
+                    bf = base_frames[j]
+                    mat = mats_list[j]
+                    fy1, fy2, fx1, fx2 = coords_list[j]
+                    w_speak = float(speak_weights[frame_idx])
+                    jaw_poly = jaw_polys[j]
 
-                    if fast_gfpgan is not None and kps5_base is not None:
-                        work_full = bf.copy()
-                        work_full[fy1:fy2, fx1:fx2] = p_up
-                        kps5_cur = cv2.transform(kps5_base, mat).reshape(-1, 2)
-                        restored_full = fast_gfpgan.restore_face(work_full, kps5_cur)
-                        cand_patch = restored_full[fy1:fy2, fx1:fx2]
-                        enh_patch = lock_lip_and_skin_color(
-                            cand_patch,
-                            bf[fy1:fy2, fx1:fx2],
-                            outer_lip_local,
-                            mouth_ref_stats,
-                            apply_unsharp=False,
-                        )
+                    if w_speak <= 0.02:
+                        # Pure silence frame: zero blend & skip GFPGAN entirely
+                        final_frame = bf
                     else:
-                        enh_patch = lock_lip_and_skin_color(
-                            p_up,
-                            bf[fy1:fy2, fx1:fx2],
-                            outer_lip_local,
-                            mouth_ref_stats,
-                            apply_unsharp=True,
-                        )
+                        p_up = cv2.resize(pred_np[j], (fx2 - fx1, fy2 - fy1), interpolation=cv2.INTER_CUBIC)
+                        outer_lip_local = None
+                        if outer_lip_base is not None:
+                            ol_t = cv2.transform(outer_lip_base, mat).reshape(-1, 2)
+                            outer_lip_local = ol_t - np.array([fx1, fy1], dtype=np.float32)
 
-                    # Apply text-driven Cantonese Viseme micro-modulation (rounded / spread / open / bilabial)
-                    if apply_viseme_mouth_warp is not None and outer_lip_local is not None:
-                        mc = (float(outer_lip_local[:, 0].mean()), float(outer_lip_local[:, 1].mean()))
-                        mw = float(outer_lip_local[:, 0].max() - outer_lip_local[:, 0].min())
-                        mh = float(outer_lip_local[:, 1].max() - outer_lip_local[:, 1].min())
-                        enh_patch = apply_viseme_mouth_warp(
-                            enh_patch,
-                            mouth_center=mc,
-                            mouth_w=mw,
-                            mouth_h=mh,
-                            open_scale=float(vis_open_arr[frame_idx]),
-                            width_scale=float(vis_width_arr[frame_idx]),
-                        )
+                        if fast_gfpgan is not None and kps5_base is not None:
+                            work_full = bf.copy()
+                            work_full[fy1:fy2, fx1:fx2] = p_up
+                            kps5_cur = cv2.transform(kps5_base, mat).reshape(-1, 2)
+                            restored_full = fast_gfpgan.restore_face(work_full, kps5_cur)
+                            cand_patch = restored_full[fy1:fy2, fx1:fx2]
+                            enh_patch = lock_lip_and_skin_color(
+                                cand_patch,
+                                bf[fy1:fy2, fx1:fx2],
+                                outer_lip_local,
+                                mouth_ref_stats,
+                                apply_unsharp=False,
+                            )
+                        else:
+                            enh_patch = lock_lip_and_skin_color(
+                                p_up,
+                                bf[fy1:fy2, fx1:fx2],
+                                outer_lip_local,
+                                mouth_ref_stats,
+                                apply_unsharp=True,
+                            )
 
-                    final_frame = bf.copy()
-                    if jaw_poly is not None:
-                        # Tight mouth+chin convex hull mask keeps cheeks/nose/jawline 100% original portrait pixels
-                        local_poly = jaw_poly.copy()
-                        local_poly[:, :, 0] -= fx1
-                        local_poly[:, :, 1] -= fy1
-                        ph, pw = fy2 - fy1, fx2 - fx1
-                        mask = np.zeros((ph, pw), dtype=np.float32)
-                        cv2.fillConvexPoly(mask, local_poly, 1.0)
-                        mask = cv2.GaussianBlur(mask, (blur_k, blur_k), blur_sigma)
-                        mask_3c = (mask * w_speak)[:, :, None]
-                        base_patch = bf[fy1:fy2, fx1:fx2].astype(np.float32)
-                        blended = np.clip(enh_patch.astype(np.float32) * mask_3c + base_patch * (1.0 - mask_3c), 0, 255).astype(np.uint8)
-                        final_frame[fy1:fy2, fx1:fx2] = blended
-                    else:
-                        final_frame[fy1:fy2, fx1:fx2] = enh_patch
+                        # Apply text-driven Cantonese Viseme micro-modulation (rounded / spread / open / bilabial)
+                        if apply_viseme_mouth_warp is not None and outer_lip_local is not None:
+                            mc = (float(outer_lip_local[:, 0].mean()), float(outer_lip_local[:, 1].mean()))
+                            mw = float(outer_lip_local[:, 0].max() - outer_lip_local[:, 0].min())
+                            mh = float(outer_lip_local[:, 1].max() - outer_lip_local[:, 1].min())
+                            enh_patch = apply_viseme_mouth_warp(
+                                enh_patch,
+                                mouth_center=mc,
+                                mouth_w=mw,
+                                mouth_h=mh,
+                                open_scale=float(vis_open_arr[frame_idx]),
+                                width_scale=float(vis_width_arr[frame_idx]),
+                            )
+
+                        final_frame = bf.copy()
+                        if jaw_poly is not None:
+                            # Tight mouth+chin convex hull mask keeps cheeks/nose/jawline 100% original portrait pixels
+                            local_poly = jaw_poly.copy()
+                            local_poly[:, :, 0] -= fx1
+                            local_poly[:, :, 1] -= fy1
+                            ph, pw = fy2 - fy1, fx2 - fx1
+                            mask = np.zeros((ph, pw), dtype=np.float32)
+                            cv2.fillConvexPoly(mask, local_poly, 1.0)
+                            mask = cv2.GaussianBlur(mask, (blur_k, blur_k), blur_sigma)
+                            mask_3c = (mask * w_speak)[:, :, None]
+                            base_patch = bf[fy1:fy2, fx1:fx2].astype(np.float32)
+                            blended = np.clip(enh_patch.astype(np.float32) * mask_3c + base_patch * (1.0 - mask_3c), 0, 255).astype(np.uint8)
+                            final_frame[fy1:fy2, fx1:fx2] = blended
+                        else:
+                            final_frame[fy1:fy2, fx1:fx2] = enh_patch
+
+                    if b_alpha > 0.005 and broll_overlay is not None:
+                        br_frame = broll_overlay.render_frame(t_sec)
+                        final_frame = cv2.addWeighted(br_frame, b_alpha, final_frame, 1.0 - b_alpha, 0)
 
                 if sub_renderer.entries:
                     final_frame = sub_renderer.draw(final_frame, frame_idx)
@@ -1168,6 +1316,11 @@ def main() -> None:
     parser.add_argument("--subtitles", action="store_true", help="Burn Traditional Chinese subtitles from --text / --text-file.")
     parser.add_argument("--subtitle-text", help="Explicit Traditional Chinese subtitle text to burn onto the video.")
     parser.add_argument("--subtitle-timeline", help="Path to JSON subtitle timeline generated by cosy_batch_tts.py.")
+    parser.add_argument("--censor-subtitles", action="store_true", help="Mask sensitive words (e.g. 自殺/輕生) as 'xx' on subtitles.")
+    parser.add_argument("--broll-image", help="Optional B-roll / news scene image to smoothly display mid-video.")
+    parser.add_argument("--broll-start", type=float, help="B-roll start timestamp in seconds.")
+    parser.add_argument("--broll-end", type=float, help="B-roll end timestamp in seconds.")
+    parser.add_argument("--broll-label", help="Optional subtle corner badge text on B-roll (e.g. 現場畫面).")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -1211,6 +1364,11 @@ def main() -> None:
             batch_size=args.batch_size,
             subtitle_text=sub_txt,
             subtitle_timeline=args.subtitle_timeline,
+            censor_subtitles=args.censor_subtitles,
+            broll_image=args.broll_image,
+            broll_start=args.broll_start,
+            broll_end=args.broll_end,
+            broll_label=args.broll_label,
         )
     finally:
         if args.keep_temp:

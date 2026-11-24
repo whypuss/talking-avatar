@@ -35,6 +35,38 @@ _ATOMIC_TOKEN_RE = re.compile(
     r"(?:(?:HK\$|US\$|MOP|HKD|USD|RMB|CNY)\s*)?[+-]?\d+(?:,\d{3})*(?:\.\d+)?(?:%|萬|億|千|百|年|月|日|度|℃|°C|個|名|宗|次)?"
 )
 
+# Sensitive terms filtered to 'xx' on burned-in subtitles (ordered longest-first to avoid 'xxxx' doubling)
+_DEFAULT_SENSITIVE_TERMS = (
+    "自殺身亡",
+    "自殺死亡",
+    "自殺",
+    "輕生",
+    "自殘",
+    "自盡",
+    "跳樓",
+    "上吊",
+    "割腕",
+    "身亡",
+    "死亡",
+    "謀殺",
+    "兇殺",
+    "殺害",
+)
+
+
+def censor_subtitle_text(text: str, extra_words: list[str] | None = None) -> str:
+    """Replace sensitive words in display subtitles with 'xx' while leaving spoken TTS intact."""
+    if not text:
+        return text
+    terms = list(_DEFAULT_SENSITIVE_TERMS)
+    if extra_words:
+        terms.extend(w.strip() for w in extra_words if w and w.strip())
+    terms = sorted(set(terms), key=len, reverse=True)
+    if not terms:
+        return text
+    pattern = re.compile("|".join(re.escape(t) for t in terms))
+    return pattern.sub("xx", text)
+
 
 def _digits_verbatim(s: str) -> str:
     return "".join(_DIGITS[int(ch)] for ch in s if ch.isdigit())
@@ -253,6 +285,19 @@ def normalize_cantonese_tts(text: str) -> str:
         return number_str_to_cantonese(m.group(0))
 
     s = re.sub(r"(?<![A-Za-z0-9])[+-]?\d+(?:\.\d+)?", _repl_number, s)
+
+    # 11. Make parenthetical clauses read naturally in Cantonese TTS (avoid awkward pauses on brackets)
+    def _repl_parens(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        if not inner:
+            return ""
+        # Short appositives like 今年（二零二六年） or 傳媒（澳廣視） flow directly; longer clauses take a comma
+        if len(inner) <= 6:
+            return inner
+        return f"，{inner}"
+
+    s = re.sub(r"[（(]([^）)]+)[）)]", _repl_parens, s)
+    s = re.sub(r"[，,]{2,}", "，", s)
 
     return s
 
@@ -516,10 +561,13 @@ def build_synced_subtitle_chunks(
     start_sec: float,
     end_sec: float,
     max_chars: int = 24,
+    censor: bool = False,
 ) -> list[dict]:
     """
     Break a display sentence into readable subtitle lines proportioned by SPOKEN Cantonese syllable count
     (so '3.4%' gets weight for '百分之三點四', staying tightly synced with audio).
+    When censor=True, sensitive terms in the rendered subtitle text are masked as 'xx' while timing
+    weights still follow the true spoken syllable lengths.
     """
     lines = split_subtitle_lines(display_sentence, max_chars=max_chars)
     if not lines:
@@ -535,10 +583,11 @@ def build_synced_subtitle_chunks(
             seg_end = end_sec
         else:
             seg_end = cursor + dur * (w / float(total_w))
+        shown = censor_subtitle_text(line) if censor else line
         entries.append({
             "start": round(cursor, 3),
             "end": round(seg_end, 3),
-            "text": line,
+            "text": shown,
         })
         cursor = seg_end
     return entries

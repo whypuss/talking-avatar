@@ -4,6 +4,7 @@
 import unittest
 from cantonese_tn import (
     build_synced_subtitle_chunks,
+    censor_subtitle_text,
     int_to_cantonese,
     normalize_cantonese_tts,
     split_subtitle_lines,
@@ -92,6 +93,18 @@ class TestCantoneseTN(unittest.TestCase):
         # Spoken ratio: 16 vs 11 syllables -> second chunk should get ~40% of duration, not tiny 28%
         dur2 = chunks[1]["end"] - chunks[1]["start"]
         self.assertGreater(dur2, 3.6)
+
+    def test_sensitive_subtitle_censoring_and_parens_tts(self):
+        self.assertEqual(
+            censor_subtitle_text("涉及墮樓及輕生事件，季度自殺死亡監測，至少39宗自殺身亡個案"),
+            "涉及墮樓及xx事件，季度xx監測，至少39宗xx個案",
+        )
+        tts = normalize_cantonese_tts("今年（2026年）首六個月錄得39宗（當中涵蓋不同方式），截至11月。")
+        self.assertIn("今年二零二六年", tts)
+        self.assertIn("三十九宗", tts)
+        self.assertIn("截至十一月", tts)
+        self.assertNotIn("（", tts)
+        self.assertNotIn("）", tts)
 
 
 if __name__ == "__main__":
