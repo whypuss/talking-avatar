@@ -1,20 +1,23 @@
 # whytalkv3 (全畫面高清串流 MPS 對口型數字人) — `whyv2` 穩定版
 
-> **當前穩定里程碑版本**：`whyv2`（單圖主播高清口播版）／ **`whypv2`**（雙圖新聞播報獨立版本線：圖 1 `whyv2` 主播＋圖 2 現場照片自動裁白邊平滑 B-roll 插播＋敏感詞字幕自動過濾為 `xx`）
-> **歷史里程碑**：`whyv1`（`09edf37`）— 粵語數字／百分比雙軌正規化、均衡防截斷切片與二階平滑低頻頭部動作基準版；`whyv2`（`b6beabe`）— 1-Shot MPS GFPGAN v1.4 原圖級嘴部還原＋原圖雙區 LAB 唇色鎖定＋粵語文字 Viseme 口型。
+> **當前穩定里程碑版本**：`whyv2`（單圖主播高清口播版）／ `whypv2`（雙圖新聞播報＋敏感詞字幕過濾）／ **`whypv3`**（完整版：`whypv2` 雙圖新聞視頻 ＋ **自動同步產出 1280×720 爆款 YouTube 封面圖**）
+> **歷史里程碑**：`whyv1`（`09edf37`）｜ `whyv2`（`b6beabe`）｜ `whypv2`（`3fbb298`）
 
-## 雙圖新聞播報一鍵執行 (`whypv2.py` — `whypv2` 版本線)
+## 雙圖新聞播報 ＋ 自動 YouTube 封面一鍵執行 (`whypv3.py` — `whypv3` 版本線)
 
 ```bash
-cd ~/projects/whytalk && .venv/bin/python whypv2.py \
+cd ~/projects/whytalk && .venv/bin/python whypv3.py \
   --image "anchor.jpg" \
   --image2 "scene.jpg" \
   --text "新聞口播內容..." \
   --voice-ref 女主播h \
-  --output output/whypv2_out.mp4
+  --output output/whypv3_out.mp4
 ```
 
-- 預設啟用：`whyv2` 高清嘴部還原與原圖唇色鎖定、自動偵測現場段落平滑插播圖 2（去白邊＋Ken Burns 緩推鏡＋「現場資料」角標＋字幕不中斷）、以及敏感詞字幕過濾為 `xx`（僅過濾畫面字幕，語音維持自然播報）。
+- 一次輸出兩個成品：
+  1. **`output/whypv3_out.mp4`**：圖 1 `whyv2` 高清主播＋圖 2 自動對齊現場段落平滑 B-roll 插播＋敏感詞字幕過濾為 `xx`＋24kHz 粵語原聲；
+  2. **`output/whypv3_out_cover.jpg`**：標準 `1280×720`（2× 超採樣）雙圖斜切分屏 YouTube 封面圖，自動從新聞稿萃取亮眼金黃主標與紅框數字鉤子，並強制避開違規敏感詞。
+- 亦可單獨加 `--cover-only` 秒級重出封面圖，或使用 `whypv2.py` 僅輸出雙圖視頻。
 
 將任意人像圖片與文字（或預先合成的音訊）轉換成**保留完整原始構圖、自然呼吸微動、自然頭部與眨眼動作、高清嘴部與毫秒級同步字幕**的 MP4 講話視頻。專為 **Apple Silicon (M1/M2 8GB 統一記憶體)** 深度最佳化，採用單進程分句 CosyVoice2-Yue + 零硬切串流 Apple MPS Wav2Lip-GAN 架構。
 

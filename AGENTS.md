@@ -23,3 +23,13 @@ cd ~/projects/whytalk && .venv/bin/python whytalkv3.py \
     --voice-ref 女主播h \
     --output output/whypv2_out.mp4
   ```
+- 當使用者要求「用 **whypv3** 製作視頻」（在 `whypv2` 基礎上**同時自動生成 1280×720 亮眼 YouTube 封面圖 `<output>_cover.jpg`**）時，執行獨立入口 `whypv3.py`：
+  ```bash
+  cd ~/projects/whytalk && .venv/bin/python whypv3.py \
+    --image "<圖1 主播圖片>" \
+    --image2 "<圖2 現場圖片>" \
+    --text "<繁體中文新聞口播內容>" \
+    --voice-ref 女主播h \
+    --output output/whypv3_out.mp4
+  ```
+  支援 `--cover-only` 單獨重出封面圖，及 `--cover-line1` / `--cover-highlight-val` 等微調參數。
