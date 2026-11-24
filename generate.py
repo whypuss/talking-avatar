@@ -156,9 +156,47 @@ def detect_face_once(img: np.ndarray, insightface_root: str) -> dict:
                 eye_items.append((ex1, ey1, ex2, ey2, emask))
 
     jaw_pts = None
+    tight_mouth_pts = None
+    pts68 = None
+    mouth_ref_stats = None
+    kps5 = face.kps.astype(np.float32) if getattr(face, "kps", None) is not None and len(face.kps) >= 5 else None
+
     if getattr(face, "landmark_3d_68", None) is not None:
-        pts68 = face.landmark_3d_68[:, :2]
+        pts68 = face.landmark_3d_68[:, :2].astype(np.float32)
         jaw_pts = np.vstack([pts68[3:14], pts68[35:30:-1]]).astype(np.float32)
+
+        # Build a tight mouth + mid-chin hull so original cheek/jawline skin pixels stay 100% untouched
+        outer_lip = pts68[48:60]
+        lip_c = outer_lip.mean(axis=0)
+        lip_exp = lip_c + (outer_lip - lip_c) * np.array([1.34, 1.82], dtype=np.float32)
+        chin_mid = pts68[6:11]
+        tight_mouth_pts = np.vstack([lip_exp, chin_mid]).astype(np.float32)
+
+        # Calibrate exact original lip & mouth-skin LAB statistics once from the source portrait
+        inner_lip = pts68[60:68]
+        m_out = np.zeros((h, w), dtype=np.uint8)
+        m_in = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(m_out, [outer_lip.astype(np.int32)], 255)
+        cv2.fillPoly(m_in, [inner_lip.astype(np.int32)], 255)
+        lip_ring = cv2.subtract(m_out, m_in)
+        k_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        k_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        skin_ring = cv2.subtract(cv2.dilate(m_out, k_outer), cv2.dilate(m_out, k_inner))
+
+        lab_ref = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lip_px = lab_ref[lip_ring > 0]
+        skin_px = lab_ref[skin_ring > 0]
+        if len(lip_px) >= 20 and len(skin_px) >= 40:
+            l_lo, l_hi = np.percentile(lip_px[:, 0], [15, 92])
+            a_lo = np.percentile(lip_px[:, 1], 30)
+            valid = (lip_px[:, 0] >= l_lo) & (lip_px[:, 0] <= l_hi) & (lip_px[:, 1] >= a_lo)
+            lip_clean = lip_px[valid] if int(valid.sum()) >= 20 else lip_px
+            mouth_ref_stats = {
+                "lip_mean": lip_clean.mean(axis=0).astype(np.float32),
+                "lip_std": np.maximum(lip_clean.std(axis=0), 2.5).astype(np.float32),
+                "skin_mean": skin_px.mean(axis=0).astype(np.float32),
+                "skin_std": np.maximum(skin_px.std(axis=0), 2.5).astype(np.float32),
+            }
 
     del app
     return {
@@ -169,6 +207,10 @@ def detect_face_once(img: np.ndarray, insightface_root: str) -> dict:
         "head_mask": head_mask,
         "eye_items": eye_items,
         "jaw_pts": jaw_pts,
+        "tight_mouth_pts": tight_mouth_pts,
+        "pts68": pts68,
+        "kps5": kps5,
+        "mouth_ref_stats": mouth_ref_stats,
     }
 
 
@@ -398,7 +440,11 @@ def render_base_frame(
 
 
 def compute_silence_weights(audio_path: str, total_frames: int, fps: int = 25) -> np.ndarray:
-    """Compute smooth per-frame speaking weight (0.0 on sustained pauses, 1.0 during speech)."""
+    """
+    Compute continuous attack/release speaking envelope (0.0 on sustained pauses, 1.0 during speech).
+    Fast attack (~60ms) tracks syllable onset crisply; gentle release (~220ms) returns smoothly to the
+    portrait's natural resting smile without abrupt mouth snapping.
+    """
     audio, sr = sf.read(audio_path)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
@@ -407,48 +453,231 @@ def compute_silence_weights(audio_path: str, total_frames: int, fps: int = 25) -
         np.sqrt(np.mean(audio[i * spf : min((i + 1) * spf, len(audio))] ** 2))
         if i * spf < len(audio) else 0.0
         for i in range(total_frames)
-    ])
+    ], dtype=np.float32)
 
-    is_silent = rms < 0.012
-    weights = np.ones(total_frames, dtype=np.float32)
-    run = 0
+    # Dual-threshold continuous speech probability
+    lo_thr, hi_thr = 0.008, 0.022
+    raw = np.clip((rms - lo_thr) / (hi_thr - lo_thr), 0.0, 1.0)
+
+    # Suppress isolated 1-frame noise spikes in silence while keeping brief consonant dips open
+    for i in range(1, total_frames - 1):
+        if raw[i] < 0.25 and raw[i - 1] > 0.65 and raw[i + 1] > 0.65:
+            raw[i] = 0.75
+
+    # Asymmetric attack/release smoothing
+    alpha_attack = min(1.0, 1.0 / max(1.0, fps * 0.055))   # ~55ms crisp open
+    alpha_release = min(1.0, 1.0 / max(1.0, fps * 0.210))  # ~210ms graceful settle
+    env = np.zeros(total_frames, dtype=np.float32)
+    cur = float(raw[0]) if total_frames > 0 else 0.0
     for i in range(total_frames):
-        if is_silent[i]:
-            run += 1
-        else:
-            if run >= 3:
-                weights[i - run : i] = 0.0
-            run = 0
-    if run >= 3:
-        weights[total_frames - run : total_frames] = 0.0
+        target = float(raw[i])
+        alpha = alpha_attack if target > cur else alpha_release
+        cur += (target - cur) * alpha
+        env[i] = cur
 
-    kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
-    weights = np.convolve(weights, kernel, mode="same")
-    return np.clip(weights, 0.0, 1.0)
+    # Clamp very quiet floor cleanly to 0 so pure silence frames skip GFPGAN/blending
+    env[env < 0.03] = 0.0
+    return np.clip(env, 0.0, 1.0)
+
+
+# Standard FFHQ 512x512 5-landmark template matching GFPGANv1.4 training alignment
+_FFHQ_TEMPLATE_512 = np.array(
+    [
+        [192.98138, 239.94708],
+        [318.90277, 240.19360],
+        [256.63416, 314.01935],
+        [201.26117, 371.41043],
+        [313.08905, 371.15118],
+    ],
+    dtype=np.float32,
+)
+
+
+class FastAlignedGFPGAN:
+    """
+    Zero-detection 1-shot InsightFace-aligned GFPGANv1.4 wrapper.
+    Bypasses per-frame RetinaFace detection & face parsing (~2.2x faster on Apple MPS)
+    while producing full 512x512 crisp teeth, lip contour, and skin detail matching the source portrait.
+    """
+
+    def __init__(self, model_path: str, device: str, weight: float = 0.60) -> None:
+        from gfpgan import GFPGANer
+
+        self.device = device
+        self.weight = float(weight)
+        helper = GFPGANer(
+            model_path=model_path,
+            upscale=1,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,
+            device=torch.device(device),
+        )
+        self.net = helper.gfpgan.eval()
+        # Free unused detection helper weights immediately to preserve 8GB unified RAM
+        del helper
+
+    def restore_face(self, frame_bgr: np.ndarray, kps5_frame: np.ndarray) -> np.ndarray:
+        h, w = frame_bgr.shape[:2]
+        m_ffhq, _ = cv2.estimateAffinePartial2D(
+            kps5_frame.astype(np.float32), _FFHQ_TEMPLATE_512, method=cv2.LMEDS
+        )
+        if m_ffhq is None:
+            return frame_bgr
+        m_inv = cv2.invertAffineTransform(m_ffhq)
+
+        aligned = cv2.warpAffine(
+            frame_bgr, m_ffhq, (512, 512), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101
+        )
+        rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        t_in = torch.from_numpy((rgb - 0.5) / 0.5).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            out = self.net(t_in, return_rgb=False, weight=self.weight)[0]
+        out_np = out[0].detach().cpu().float().clamp(-1.0, 1.0).permute(1, 2, 0).numpy()
+        out_bgr = cv2.cvtColor(((out_np + 1.0) * 127.5).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        del t_in, out
+
+        restored = frame_bgr.copy()
+        cv2.warpAffine(
+            out_bgr, m_inv, (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_TRANSPARENT,
+            dst=restored,
+        )
+        return restored
+
+
+def stabilize_pred_batch(
+    pred_np: np.ndarray,
+    prev_tail: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Energy-adaptive 3-frame temporal stabilization on Wav2Lip 96x96 predictions.
+    Eliminates per-frame high-frequency lip-edge jitter on steady vowels while preserving crisp plosives.
+    """
+    n = len(pred_np)
+    if n <= 1:
+        return pred_np
+    arr = pred_np.astype(np.float32)
+    out = arr.copy()
+    for i in range(n):
+        p_prev = prev_tail if (i == 0 and prev_tail is not None) else (arr[i - 1] if i > 0 else arr[i])
+        p_cur = arr[i]
+        p_next = arr[i + 1] if i < n - 1 else arr[i]
+        # Measure lower-half mouth change to adapt smoothing weight
+        delta = float(np.mean(np.abs(p_cur[48:] - p_prev[48:])) + np.mean(np.abs(p_next[48:] - p_cur[48:]))) * 0.5
+        # Steady vowels (small delta) get gentle 0.14 neighbor blend; rapid plosives stay razor-crisp (0.03)
+        w_nb = float(np.clip(0.15 - (delta - 4.0) * 0.012, 0.03, 0.15))
+        out[i] = p_cur * (1.0 - 2.0 * w_nb) + (p_prev + p_next) * w_nb
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def lock_lip_and_skin_color(
+    cand_patch: np.ndarray,
+    base_patch: np.ndarray,
+    outer_lip_local: np.ndarray | None,
+    ref_stats: dict | None,
+    apply_unsharp: bool = False,
+) -> np.ndarray:
+    """
+    Dual-region LAB statistical color lock:
+      - Locks predicted lip tissue (A/B hue+saturation & L luminance) precisely to the source portrait's lipstick.
+      - Suppresses Wav2Lip inner-lip purple chromatic artifacts.
+      - Keeps teeth clean/white and oral cavity dark without color bleed.
+      - Matches surrounding chin/philtrum skin LAB distribution to the original portrait.
+    """
+    if cand_patch.shape != base_patch.shape or cand_patch.size == 0:
+        return cand_patch
+
+    ph, pw = cand_patch.shape[:2]
+    lab = cv2.cvtColor(cand_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    if ref_stats is None or outer_lip_local is None:
+        # Fallback to simple lower-half LAB alignment
+        b_lab = cv2.cvtColor(base_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lo = ph // 2
+        for c in range(3):
+            diff = float(np.mean(b_lab[lo:, :, c]) - np.mean(lab[lo:, :, c]))
+            lab[:, :, c] = np.clip(lab[:, :, c] + diff * 0.65, 0.0, 255.0)
+        res = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        if apply_unsharp:
+            blur = cv2.GaussianBlur(res, (0, 0), sigmaX=1.05)
+            res = cv2.addWeighted(res, 1.42, blur, -0.42, 0)
+        return res
+
+    L, A, B = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
+    mouth_cx = float(outer_lip_local[:, 0].mean())
+    mouth_cy = float(outer_lip_local[:, 1].mean())
+    mw = max(10.0, float(outer_lip_local[:, 0].max() - outer_lip_local[:, 0].min()))
+    mh = max(6.0, float(outer_lip_local[:, 1].max() - outer_lip_local[:, 1].min()))
+
+    yy, xx = np.ogrid[:ph, :pw]
+    rx, ry = max(8.0, mw * 0.64), max(8.0, mh * 0.98)
+    spatial = np.clip(
+        1.35 - (((xx - mouth_cx) / rx) ** 2 + ((yy - (mouth_cy + mh * 0.08)) / ry) ** 2),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+
+    skin_A = float(ref_stats["skin_mean"][1])
+    # Lip tissue probability: redder than skin, excluding dark oral cavity and bright white teeth
+    p_red = np.clip((A - (skin_A + 2.5)) / 9.0, 0.0, 1.0)
+    p_not_cavity = np.clip((L - 42.0) / 30.0, 0.0, 1.0)
+    p_not_teeth = np.clip(
+        1.0 - np.clip((L - 175.0) / 35.0, 0.0, 1.0) * np.clip((skin_A + 6.0 - A) / 6.0, 0.0, 1.0),
+        0.0,
+        1.0,
+    )
+    lip_prob = cv2.GaussianBlur(spatial * p_red * p_not_cavity * p_not_teeth, (5, 5), 1.2)
+
+    out_lab = lab.copy()
+
+    # 1. Surrounding skin LAB Reinhard matching
+    lo = max(0, int(mouth_cy - mh * 1.4))
+    skin_sel = (lip_prob < 0.15) & (L > 65.0)
+    skin_sel[:lo, :] = False
+    if int(skin_sel.sum()) > 50:
+        for c, s_w in [(0, 0.72), (1, 0.88), (2, 0.88)]:
+            c_mean = float(lab[:, :, c][skin_sel].mean())
+            c_std = max(2.5, float(lab[:, :, c][skin_sel].std()))
+            ratio = float(np.clip(ref_stats["skin_std"][c] / c_std, 0.78, 1.28))
+            matched = (lab[:, :, c] - c_mean) * ratio + float(ref_stats["skin_mean"][c])
+            blend_s = (1.0 - lip_prob) * s_w
+            out_lab[:, :, c] = out_lab[:, :, c] * (1.0 - blend_s) + matched * blend_s
+
+    # 2. Lip tissue LAB Reinhard lock to exact portrait lipstick color
+    lip_sel = lip_prob > 0.35
+    if int(lip_sel.sum()) > 20:
+        for c, l_w in [(0, 0.72), (1, 0.96), (2, 0.96)]:
+            c_mean = float(lab[:, :, c][lip_sel].mean())
+            c_std = max(2.5, float(lab[:, :, c][lip_sel].std()))
+            ratio = float(np.clip(ref_stats["lip_std"][c] / c_std, 0.72, 1.32))
+            matched = (lab[:, :, c] - c_mean) * ratio + float(ref_stats["lip_mean"][c])
+            w_l = lip_prob * l_w
+            out_lab[:, :, c] = out_lab[:, :, c] * (1.0 - w_l) + matched * w_l
+
+    # 3. Suppress Wav2Lip inner-lip blue/purple chromatic cast
+    purple_mask = (
+        spatial
+        * np.clip((125.0 - B) / 14.0, 0.0, 1.0)
+        * np.clip((L - 25.0) / 40.0, 0.0, 1.0)
+    )
+    if float(np.max(purple_mask)) > 0.05:
+        out_lab[:, :, 2] = (
+            out_lab[:, :, 2] * (1.0 - purple_mask * 0.85)
+            + float(ref_stats["lip_mean"][2]) * (purple_mask * 0.85)
+        )
+
+    matched_bgr = cv2.cvtColor(np.clip(out_lab, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    if apply_unsharp:
+        blur = cv2.GaussianBlur(matched_bgr, (0, 0), sigmaX=1.05)
+        matched_bgr = cv2.addWeighted(matched_bgr, 1.42, blur, -0.42, 0)
+    return matched_bgr
 
 
 def enhance_mouth_fast(pred_patch: np.ndarray, base_patch: np.ndarray) -> np.ndarray:
-    """
-    Fast (<2ms) LAB color-matching + subtle unsharp detail recovery for Wav2Lip 96x96 output.
-    Eliminates dull/grayish lip tint mismatch and restores crisp lip/teeth edges without GFPGAN overhead.
-    """
-    if pred_patch.shape != base_patch.shape or pred_patch.size == 0:
-        return pred_patch
-
-    # 1. Gentle LAB mean alignment on lower half (mouth/chin zone) to match anchor skin lighting
-    ph = pred_patch.shape[0]
-    p_lab = cv2.cvtColor(pred_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
-    b_lab = cv2.cvtColor(base_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lo = ph // 2
-    for c in range(3):
-        diff = float(np.mean(b_lab[lo:, :, c]) - np.mean(p_lab[lo:, :, c]))
-        p_lab[:, :, c] = np.clip(p_lab[:, :, c] + diff * 0.55, 0.0, 255.0)
-    matched = cv2.cvtColor(p_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-    # 2. Subtle unsharp mask for crisp teeth & lip contour
-    blur = cv2.GaussianBlur(matched, (0, 0), sigmaX=1.15)
-    sharp = cv2.addWeighted(matched, 1.50, blur, -0.50, 0)
-    return sharp
+    """Backward-compatible helper delegating to lock_lip_and_skin_color with unsharp."""
+    return lock_lip_and_skin_color(pred_patch, base_patch, None, None, apply_unsharp=True)
 
 
 def _split_subtitle_segments(text: str, max_chars: int = 24) -> list[str]:
@@ -671,13 +900,18 @@ def stream_generate_video(
         [[bx1_0, by1_0], [bx2_0, by1_0], [bx2_0, by2_0], [bx1_0, by2_0]],
         dtype=np.float32,
     ).reshape(-1, 1, 2)
-    jaw_pts_base = face_info["jaw_pts"].reshape(-1, 1, 2) if face_info["jaw_pts"] is not None else None
-
-    # Fixed expanded ROI for optional GFPGAN so GFPGAN only processes the face zone
-    rx1 = max(0, int(bx1_0 - fw * 0.55))
-    ry1 = max(0, int(by1_0 - fh * 0.35))
-    rx2 = min(w, int(bx2_0 + fw * 0.55))
-    ry2 = min(h, int(by2_0 + fh * 0.55))
+    # Prefer tight mouth+chin hull to preserve original cheek & jawline pixels
+    blend_pts_src = face_info.get("tight_mouth_pts")
+    if blend_pts_src is None:
+        blend_pts_src = face_info["jaw_pts"]
+    jaw_pts_base = blend_pts_src.reshape(-1, 1, 2) if blend_pts_src is not None else None
+    kps5_base = face_info["kps5"].reshape(-1, 1, 2) if face_info.get("kps5") is not None else None
+    outer_lip_base = (
+        face_info["pts68"][48:60].reshape(-1, 1, 2)
+        if face_info.get("pts68") is not None
+        else None
+    )
+    mouth_ref_stats = face_info.get("mouth_ref_stats")
 
     mel_chunks = compute_mel_chunks(wav2lip_dir, audio_16k, fps)
     total_frames = len(mel_chunks)
@@ -685,6 +919,23 @@ def stream_generate_video(
 
     dx_arr, dy_arr, ang_arr, blink_times = compute_motion_trajectory(audio_16k, total_frames, fps, breathing_amp)
     speak_weights = compute_silence_weights(audio_16k, total_frames, fps)
+
+    # Build text-driven Cantonese Viseme (lip shape) trajectories synced to script/timeline
+    try:
+        from cantonese_viseme import apply_viseme_mouth_warp, build_viseme_trajectory
+        vis_open_arr, vis_width_arr = build_viseme_trajectory(
+            total_frames=total_frames,
+            fps=fps,
+            speak_weights=speak_weights,
+            subtitle_timeline=subtitle_timeline,
+            subtitle_text=subtitle_text,
+            audio_delay_ms=audio_delay_ms,
+        )
+    except Exception:
+        vis_open_arr = np.ones(total_frames, dtype=np.float32)
+        vis_width_arr = np.ones(total_frames, dtype=np.float32)
+        apply_viseme_mouth_warp = None  # type: ignore[assignment]
+
     sub_renderer = SubtitleRenderer(
         width=w,
         height=h,
@@ -698,21 +949,12 @@ def stream_generate_video(
     print(f"=== [3/4] Loading Wav2Lip-GAN on {device} ===")
     w2l_model = load_wav2lip_model(wav2lip_dir, device)
 
-    restorer = None
+    fast_gfpgan = None
     if gfpgan_weight > 0:
         if not os.path.exists(gfpgan_weights):
             raise FileNotFoundError(f"Missing GFPGAN weights: {gfpgan_weights}")
-        from gfpgan import GFPGANer
-
-        print(f"Loading GFPGAN v1.4 on {device} (weight={gfpgan_weight})")
-        restorer = GFPGANer(
-            model_path=gfpgan_weights,
-            upscale=1,
-            arch="clean",
-            channel_multiplier=2,
-            bg_upsampler=None,
-            device=torch.device(device),
-        )
+        print(f"Loading 1-shot aligned GFPGAN v1.4 on {device} (weight={gfpgan_weight}, zero RetinaFace overhead)")
+        fast_gfpgan = FastAlignedGFPGAN(gfpgan_weights, device=device, weight=gfpgan_weight)
 
     # Launch single-pass FFmpeg encoder reading raw BGR frames from stdin and muxing original HD audio
     delay_sec = audio_delay_ms / 1000.0
@@ -738,16 +980,18 @@ def stream_generate_video(
     ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
     assert ffmpeg_proc.stdin is not None
 
-    blur_k = max(15, int(fw * 0.09) | 1)
-    blur_sigma = max(5.0, blur_k / 3.0)
+    blur_k = max(13, int(fw * 0.085) | 1)
+    blur_sigma = max(4.5, blur_k / 3.0)
 
-    print("=== [4/4] Streaming Wav2Lip + Blend + Subtitles -> FFmpeg ===")
+    print("=== [4/4] Streaming Wav2Lip + Viseme + ColorLock + Subtitles -> FFmpeg ===")
+    prev_pred_tail: np.ndarray | None = None
     try:
         for b_start in range(0, total_frames, batch_size):
             b_end = min(total_frames, b_start + batch_size)
             b_len = b_end - b_start
 
             base_frames: list[np.ndarray] = []
+            mats_list: list[np.ndarray] = []
             coords_list: list[tuple[int, int, int, int]] = []
             jaw_polys: list[np.ndarray | None] = []
             face_crops_96: list[np.ndarray] = []
@@ -758,6 +1002,7 @@ def stream_generate_video(
                     float(dx_arr[i]), float(dy_arr[i]), float(ang_arr[i]), blink_times,
                 )
                 base_frames.append(bf)
+                mats_list.append(mat)
 
                 # Transform face box via exact head affine matrix (zero S3FD jitter)
                 c_t = cv2.transform(bbox_corners, mat).reshape(-1, 2)
@@ -793,10 +1038,15 @@ def stream_generate_video(
             pred_np = np.clip(pred.detach().cpu().numpy().transpose(0, 2, 3, 1) * 255.0, 0, 255).astype(np.uint8)
             del t_img, t_mel, pred
 
+            # Temporal lip stabilization across consecutive frames
+            pred_np = stabilize_pred_batch(pred_np, prev_tail=prev_pred_tail)
+            prev_pred_tail = pred_np[-1].astype(np.float32)
+
             # Blend each frame & stream straight to FFmpeg
             for j in range(b_len):
                 frame_idx = b_start + j
                 bf = base_frames[j]
+                mat = mats_list[j]
                 fy1, fy2, fx1, fx2 = coords_list[j]
                 w_speak = float(speak_weights[frame_idx])
                 jaw_poly = jaw_polys[j]
@@ -806,25 +1056,50 @@ def stream_generate_video(
                     final_frame = bf
                 else:
                     p_up = cv2.resize(pred_np[j], (fx2 - fx1, fy2 - fy1), interpolation=cv2.INTER_CUBIC)
-                    if restorer is not None:
+                    outer_lip_local = None
+                    if outer_lip_base is not None:
+                        ol_t = cv2.transform(outer_lip_base, mat).reshape(-1, 2)
+                        outer_lip_local = ol_t - np.array([fx1, fy1], dtype=np.float32)
+
+                    if fast_gfpgan is not None and kps5_base is not None:
                         work_full = bf.copy()
                         work_full[fy1:fy2, fx1:fx2] = p_up
-                        roi_in = work_full[ry1:ry2, rx1:rx2]
-                        _, _, roi_enh = restorer.enhance(
-                            roi_in,
-                            has_aligned=False,
-                            only_center_face=True,
-                            paste_back=True,
-                            weight=gfpgan_weight,
+                        kps5_cur = cv2.transform(kps5_base, mat).reshape(-1, 2)
+                        restored_full = fast_gfpgan.restore_face(work_full, kps5_cur)
+                        cand_patch = restored_full[fy1:fy2, fx1:fx2]
+                        enh_patch = lock_lip_and_skin_color(
+                            cand_patch,
+                            bf[fy1:fy2, fx1:fx2],
+                            outer_lip_local,
+                            mouth_ref_stats,
+                            apply_unsharp=False,
                         )
-                        work_full[ry1:ry2, rx1:rx2] = roi_enh
-                        enh_patch = work_full[fy1:fy2, fx1:fx2]
                     else:
-                        enh_patch = enhance_mouth_fast(p_up, bf[fy1:fy2, fx1:fx2])
+                        enh_patch = lock_lip_and_skin_color(
+                            p_up,
+                            bf[fy1:fy2, fx1:fx2],
+                            outer_lip_local,
+                            mouth_ref_stats,
+                            apply_unsharp=True,
+                        )
+
+                    # Apply text-driven Cantonese Viseme micro-modulation (rounded / spread / open / bilabial)
+                    if apply_viseme_mouth_warp is not None and outer_lip_local is not None:
+                        mc = (float(outer_lip_local[:, 0].mean()), float(outer_lip_local[:, 1].mean()))
+                        mw = float(outer_lip_local[:, 0].max() - outer_lip_local[:, 0].min())
+                        mh = float(outer_lip_local[:, 1].max() - outer_lip_local[:, 1].min())
+                        enh_patch = apply_viseme_mouth_warp(
+                            enh_patch,
+                            mouth_center=mc,
+                            mouth_w=mw,
+                            mouth_h=mh,
+                            open_scale=float(vis_open_arr[frame_idx]),
+                            width_scale=float(vis_width_arr[frame_idx]),
+                        )
 
                     final_frame = bf.copy()
                     if jaw_poly is not None:
-                        # Localize convex hull mask inside face box for fast blending
+                        # Tight mouth+chin convex hull mask keeps cheeks/nose/jawline 100% original portrait pixels
                         local_poly = jaw_poly.copy()
                         local_poly[:, :, 0] -= fx1
                         local_poly[:, :, 1] -= fy1

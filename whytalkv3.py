@@ -118,7 +118,8 @@ def main() -> None:
         default=0,
         help="Optional legacy hard-chunking in seconds (0 = seamless streaming single-pass, recommended).",
     )
-    parser.add_argument("--hd", action="store_true", help="Enable MPS-accelerated GFPGAN v1.4 HD restoration.")
+    parser.add_argument("--hd", action="store_true", help="Enable 1-shot MPS GFPGAN v1.4 HD mouth restoration (enabled by default).")
+    parser.add_argument("--fast", action="store_true", help="Disable GFPGAN for ultra-fast preview (still keeps lip color lock & text visemes).")
     parser.add_argument("--no-subtitles", action="store_true", help="Disable Traditional Chinese subtitles.")
     args = parser.parse_args()
 
@@ -149,7 +150,7 @@ def main() -> None:
             )
 
         duration = get_duration(audio_wav)
-        gfpgan_w = "0.65" if args.hd else "0"
+        gfpgan_w = "0" if args.fast else "0.60"
         sub_full = "" if args.no_subtitles else (args.subtitle_text or args.text or "")
 
         # 2. Video generation: seamless streaming single-pass by default (zero jump-cuts, low RAM)

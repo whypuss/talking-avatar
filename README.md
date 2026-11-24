@@ -31,7 +31,7 @@ cd ~/projects/whytalk && .venv/bin/python whytalkv3.py \
 | | **Edge TTS** (`edge-tts`) | 微軟雲端免費神經網路語音 | 透過 `--voice edge:zh-HK-HiuGaaiNeural` 調用 |
 | **2. 人臉偵測與關鍵點** | **InsightFace** (`buffalo_l` Lite：`detection` + `landmark_3d_68`) | 僅於原圖執行單次偵測取得臉框、雙眼與 68 點下顎多邊形，後續各幀以精準仿射矩陣追蹤 | 徹底消除逐幀 ONNX 與 S3FD 推論耗時與抖動 |
 | **3. 口型同步 (Lip-Sync)** | **Wav2Lip-GAN** (`wav2lip_gan.pth`) | 串流分批（預設 batch=32）於 **Apple MPS / CUDA / CPU** 直接推論，零 6 秒硬切與零 OOM | 預設下巴邊距 `--pads 0 16 8 8` 防左下唇偏移 |
-| **4. 畫質修復與融合** | **快速 LAB 色彩對齊 + Unsharp 銳化** / **MPS GFPGAN v1.4** (`--hd`) | 預設以 LAB 膚色對齊 + 嘴周銳化消除 96×96 糊嘴；開啟 `--hd` 時於 MPS 執行 GFPGAN 並自動跳過靜音幀 | 搭配自適應軟羽化 68 點下半臉凸包與 RMS 靜音停頓平滑過渡 |
+| **4. 畫質修復與融合** | **1-Shot 對齊 MPS GFPGAN v1.4（預設）+ 原圖雙區 LAB 唇色鎖定 + 粵語文字 Viseme 口型微調** | 繞過逐幀 RetinaFace（直接沿用 1-shot InsightFace 5 點對齊 FFHQ 512×512），還原與原圖一致的牙齒與唇緣像素，並以雙區 LAB 統計鎖定原圖唇色與膚色；加上 `--fast` 可切換極速預覽 | 搭配緊緻嘴周+下巴中段凸包遮罩（保留原圖兩頰與下顎像素）、能量自適應 3 幀時序防抖與 Attack/Release 平滑收口 |
 | **5. 字幕與單次直出** | **快取 RGBA 字幕 + FFmpeg** (`libx264` / `aac 192k`) | 每句字幕僅渲染一次並快取，直接透過 Raw BGR Pipe 單次編碼直出，保留原始 24kHz+ 高清音訊與 `120ms` 口型對齊 | 零中間有損壓縮、支援 `+faststart` 秒開播放 |
 
 ---
